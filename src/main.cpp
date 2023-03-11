@@ -70,15 +70,14 @@ typedef struct {
 	volatile float levelStep = 0;
 } DimInfoRec;
 
-volatile DimInfoRec* currentDimmer = NULL;
-
 inline float gammaCorrect(float value) {
 	return pow(value / homeKitBrightnessMax, ledGamma) * homeKitBrightnessMax;
 }
 
 void dimmerTask(void* params) {
-	DimInfoRec *dimInfo = (DimInfoRec*)params;
+	static volatile DimInfoRec* currentDimmer = NULL;
 
+	DimInfoRec *dimInfo = (DimInfoRec*)params;
 	TickType_t lastTicks = xTaskGetTickCount();
 
 	while (true) {
@@ -236,7 +235,7 @@ void setup() {
 	indicator.set(startColor);
 
 	Serial.begin(115200);
-	Serial.printf("HomeSpan Remote LED - Startup\n");
+	Serial.printf("Home-LED Startup\n");
 
 	Serial.printf("Init HomeSpan\n");
 	homeSpan.setSketchVersion(versionString);
