@@ -3,9 +3,17 @@
 #include "HomeSpan.h" 
 #include "extras/Pixel.h"
 
+#ifdef DEBUG
+#define SerPrintf(...) Serial.printf(__VA_ARGS__)
+#define SerBegin(...) Serial.begin(__VA_ARGS__)
+#else
+#define SerPrintf(...)
+#define SerBegin(...)
+#endif
+
 //////////////////////////////////////////////
 
-constexpr const char* versionString = "v0.1";
+constexpr const char* versionString = "v0.2";
 
 //////////////////////////////////////////////
 
@@ -27,7 +35,7 @@ LEDDeviceRec deviceList[] = {
 };
 #elif QTPYS3
 LEDDeviceRec deviceList[] = {
-    { A0, 0, "LED1", 0, 0, 0 },
+    { MISO, 0, "LED1", 0, 0, 0 },
 };
 #endif
 
@@ -41,141 +49,203 @@ constexpr uint8_t indicatorDataPin = PIN_NEOPIXEL;
 constexpr uint8_t indicatorPowerPin = NEOPIXEL_POWER;
 #endif
 
-Pixel indicator(indicatorDataPin);
-
 //////////////////////////////////////////////
 
-constexpr uint32_t ledFadeRate = 100;
-constexpr uint32_t ledFadeRateInterval = 1000 / ledFadeRate;
+constexpr uint32_t ledUpdateRate = 100;
+constexpr uint32_t ledUpdateRateInterval = 1000 / ledUpdateRate;
 
-constexpr uint32_t fadeUpTime = 500;
-constexpr uint32_t fadeDownTime = 2000;
-constexpr uint32_t fadeFastTime = 300;
+constexpr uint32_t defaultFadeUpTime = 500;
+constexpr uint32_t defaultFadeDownTime = 2000;
+constexpr uint32_t defaultFadeFastTime = 300;
 
 constexpr float homeKitBrightnessMax = 100.0;
+
+constexpr uint32_t dimmerTaskStackSize = 2000;
+
+//////////////////////////////////////////////
 
 constexpr float ledGamma = 2.8;
 constexpr uint8_t maxIndicatorValue = 50;
 
-constexpr uint8_t ledLevel = 0x03;
-Pixel::Color flashColor = Pixel::RGB(ledLevel, 0, ledLevel);
-Pixel::Color startColor = Pixel::RGB(ledLevel, 0, 0);
-Pixel::Color connectingColor = Pixel::RGB(0, 0, ledLevel);
-Pixel::Color readyColor = Pixel::RGB(0, ledLevel, 0);
+constexpr uint8_t ledStatusLevel = 0x03;
+
+#define MAKE_RGB(r, g, b) (r<<16 | g<<8 | b)
+constexpr uint32_t flashColor = MAKE_RGB(ledStatusLevel, 0, ledStatusLevel);
+constexpr uint32_t startColor = MAKE_RGB(ledStatusLevel, 0, 0);
+constexpr uint32_t connectingColor = MAKE_RGB(0, 0, ledStatusLevel);
+constexpr uint32_t readyColor = MAKE_RGB(0, ledStatusLevel, 0);
+
+uint32_t currentIndicatorColor = 0xFFFFFFFF;
+uint32_t savedIndicatorColor = 0;
+
+constexpr uint32_t whiteColorFlag = 1 << 24;
+
+Pixel indicator(indicatorDataPin);
+
+void setIndicator(uint32_t color, bool saveColor = false) {
+	if (color != currentIndicatorColor) {
+		currentIndicatorColor = color;
+		if (color & whiteColorFlag) {
+			color &= 0xFF;
+			indicator.set(Pixel::RGB(color, color, color));
+		}
+		else {
+			indicator.set(Pixel::RGB(color>>16, (color >> 8) & 0xFF, color & 0xFF));
+		}
+		if (saveColor) {
+			savedIndicatorColor = color;
+		}
+	}
+}
+
+void setIndicator8(uint8_t color8) {
+	setIndicator(whiteColorFlag | color8);
+}
+
+//////////////////////////////////////////////
 
 typedef struct {
 	LedPin* led;
 	volatile float targetLevel = 0;
 	volatile float currentLevel = 0;
+	volatile float currentCorrectedLevel = 0;
 	volatile float levelStep = 0;
 } DimInfoRec;
+
+typedef struct {
+	volatile DimInfoRec* dimInfo;
+	volatile float targetLevel;
+	volatile float levelStep;
+} DimCommandRec;
+
+constexpr auto deviceCount = sizeof(deviceList) / sizeof(LEDDeviceRec);
+
+DimInfoRec dimmerData[deviceCount];
+
+constexpr uint16_t commandQueueSize = 8;
+DimCommandRec commandQueue[commandQueueSize];
+volatile uint16_t commandQueueHead = 0;
+volatile uint16_t commandQueueTail = 0;
+
+void queueDimCommand(DimInfoRec* dimInfo, float targetLevel, float levelStep) {
+	uint16_t nextIndex = (commandQueueHead + 1) % commandQueueSize;
+
+	while (nextIndex == commandQueueTail) {}
+
+	DimCommandRec* command = &commandQueue[nextIndex];
+	command->dimInfo = dimInfo;
+	command->targetLevel = targetLevel;
+	command->levelStep = levelStep;
+	commandQueueHead = nextIndex;
+}
+
+//////////////////////////////////////////////
 
 inline float gammaCorrect(float value) {
 	return pow(value / homeKitBrightnessMax, ledGamma) * homeKitBrightnessMax;
 }
 
 void dimmerTask(void* params) {
-	static volatile DimInfoRec* currentDimmer = NULL;
-
-	DimInfoRec *dimInfo = (DimInfoRec*)params;
 	TickType_t lastTicks = xTaskGetTickCount();
+	float currentIndicatorValue = -1;
 
 	while (true) {
-		xTaskDelayUntil(&lastTicks, pdMS_TO_TICKS(ledFadeRateInterval));
+		xTaskDelayUntil(&lastTicks, pdMS_TO_TICKS(ledUpdateRateInterval));
 
-		if (dimInfo->levelStep) {
-			dimInfo->currentLevel += dimInfo->levelStep;
+		while (commandQueueTail != commandQueueHead) {
+			uint16_t nextIndex = (commandQueueTail + 1) % commandQueueSize;
+			DimCommandRec* command = &commandQueue[nextIndex];
 
-			if ((dimInfo->levelStep > 0 && dimInfo->currentLevel >= dimInfo->targetLevel) || (dimInfo->levelStep < 0 && dimInfo->currentLevel <= dimInfo->targetLevel)) {
-				dimInfo->currentLevel = dimInfo->targetLevel;
-				dimInfo->levelStep = 0;
-			}
-			float newValue = gammaCorrect(dimInfo->currentLevel);
-			dimInfo->led->set(newValue);
+			command->dimInfo->targetLevel = command->targetLevel;
+			command->dimInfo->levelStep = command->levelStep;
+			commandQueueTail = nextIndex;
+		}
 
-			if (newValue == 0) {
-				if (currentDimmer == dimInfo) {
-					indicator.set(readyColor);
-					currentDimmer = NULL;
+		float firstValue = -1;
+
+		for (auto i=0; i<deviceCount; i++) {
+			DimInfoRec* dimInfo = &dimmerData[i];
+
+			if (dimInfo->levelStep) {
+				dimInfo->currentLevel += dimInfo->levelStep;
+
+				if ((dimInfo->levelStep > 0 && dimInfo->currentLevel >= dimInfo->targetLevel) || (dimInfo->levelStep < 0 && dimInfo->currentLevel <= dimInfo->targetLevel)) {
+					dimInfo->currentLevel = dimInfo->targetLevel;
+					dimInfo->levelStep = 0;
 				}
+				dimInfo->currentCorrectedLevel = gammaCorrect(dimInfo->currentLevel);
+				dimInfo->led->set(dimInfo->currentCorrectedLevel);
+			}
+			if (firstValue==-1 && dimInfo->currentLevel>0) {
+				firstValue = dimInfo->currentCorrectedLevel;
+			}
+		}
+
+		if (firstValue != currentIndicatorValue) {
+			if (firstValue == -1) {
+				setIndicator(savedIndicatorColor);
 			}
 			else {
-				if (currentDimmer == NULL) {
-					currentDimmer = dimInfo;
-				}
-				if (currentDimmer == dimInfo) {
-					uint8_t value255 = newValue * maxIndicatorValue / homeKitBrightnessMax;
-					indicator.set(Pixel::RGB(value255, value255, value255));
-				}
+				uint8_t value255 = firstValue * maxIndicatorValue / homeKitBrightnessMax;
+				setIndicator8(max((uint8_t)1, value255));
 			}
+			currentIndicatorValue = firstValue;
 		}
 	}
 }
 
-#define FADE_STEP(duration) (homeKitBrightnessMax * ledFadeRateInterval / duration)
+//////////////////////////////////////////////
 
 float fadeStep(uint16_t duration, uint16_t defaultValue) {
-	if (duration > 0) {
-		return FADE_STEP(duration);
-	}
-	else {
-		return FADE_STEP(defaultValue);
-	}
+	return homeKitBrightnessMax * ledUpdateRateInterval / (duration==0 ? defaultValue : duration);
 }
 
 struct DimmableLED : Service::LightBulb {
 	SpanCharacteristic *_on;
 	SpanCharacteristic *_brightness;
 	
-	SpanButton* _button;
-	DimInfoRec _dimInfo;
+	SpanButton* _button = NULL;
+	DimInfoRec* _dimInfo;
 
 	float _fadeUpStep;
 	float _fadeDownStep;
 	float _fadeFastStep;
 
-	DimmableLED(LEDDeviceRec* device) : Service::LightBulb() {
+	DimmableLED(LEDDeviceRec* device, DimInfoRec* dimInfo) : Service::LightBulb() {
 		_on = new Characteristic::On();
 		_brightness = new Characteristic::Brightness(100);
 		_brightness->setRange(0, 100, 1);
 
-		_dimInfo.led = new LedPin(device->ledPin, 0, 20000);
+		_dimInfo = dimInfo;
+		_dimInfo->led = new LedPin(device->ledPin, 0, 20000);
 
-		_fadeUpStep = fadeStep(device->fadeUpDuration, fadeUpTime);
-		_fadeDownStep = fadeStep(device->fadeDownDuration, fadeDownTime);
-		_fadeFastStep = fadeStep(device->fadeFastDuration, fadeFastTime);
+		_fadeUpStep = fadeStep(device->fadeUpDuration, defaultFadeUpTime);
+		_fadeDownStep = fadeStep(device->fadeDownDuration, defaultFadeDownTime);
+		_fadeFastStep = fadeStep(device->fadeFastDuration, defaultFadeFastTime);
 
 		if (device->buttonPin != -1) {
 			_button = new SpanButton(device->buttonPin);
 		}
-
-		TaskHandle_t t;
-		xTaskCreate(dimmerTask, "LED_Dimmer", 10000, &_dimInfo, 0, &t);
 	}
 
-	void setNewLevel(float newLevel, bool immediate=false) {
-		_dimInfo.levelStep = 0;
+	void refreshLevel(bool fast = false) {
+		float currentLevel = _dimInfo->currentLevel;
+		float newLevel = _on->getNewVal() * _brightness->getNewVal();
 
-		if (newLevel != _dimInfo.currentLevel) {
+		if (newLevel != currentLevel) {
 			float step;
 
-			if (immediate) {
-				step = (newLevel >= _dimInfo.currentLevel) ? _fadeFastStep : -_fadeFastStep;
+			if (fast) {
+				step = (newLevel >= currentLevel) ? _fadeFastStep : -_fadeFastStep;
 			}
 			else {
-				step = (newLevel >= _dimInfo.currentLevel) ? _fadeUpStep : -_fadeDownStep;
+				step = (newLevel >= currentLevel) ? _fadeUpStep : -_fadeDownStep;
 			}
 
-			_dimInfo.targetLevel = newLevel;
-			_dimInfo.levelStep = step;
-			Serial.printf("setLevel %0.1f, step=%f.\n", newLevel, step);
+			queueDimCommand(_dimInfo, newLevel, step);
 		}
 	}
 
-	void refreshLevel(bool immediate = false) {
-		setNewLevel(_on->getNewVal() * _brightness->getNewVal(), immediate);
-	}
-	
 	boolean update() {
 		refreshLevel(_brightness->updated());
 		return(true);  
@@ -195,60 +265,73 @@ struct DimmableLED : Service::LightBulb {
 
 //////////////////////////////////////////////
 
-constexpr uint16_t maxDevices = sizeof(deviceList) / sizeof(LEDDeviceRec);
-
-DimmableLED* services[maxDevices];
-uint16_t deviceCount = 0;
-
 void createDevices() {
 	SPAN_ACCESSORY();   // create Bridge
 
-	for (LEDDeviceRec device : deviceList) {
-		Serial.printf("Creating \'%s\' on pin %d\n", device.name, device.ledPin);
-		SPAN_ACCESSORY(device.name);
-			services[deviceCount++] = new DimmableLED(&device);
+	for (auto i=0; i<deviceCount; i++) {
+		LEDDeviceRec* device = &deviceList[i];
+		SerPrintf("Creating \'%s\' on pin %d\n", device->name, device->ledPin);
+		SPAN_ACCESSORY(device->name);
+			new DimmableLED(device, &dimmerData[i]);
 	}
 }
 
 //////////////////////////////////////////////
 
-void flashIndicator(Pixel::Color color, uint16_t count, uint16_t period) {
-	Pixel::Color black = Pixel::RGB(0, 0, 0);
-
+void flashIndicator(uint32_t color, uint16_t count, uint16_t period) {
 	for (auto i=0; i<count; i++) {
-		indicator.set(color);
+		setIndicator(color);
 		delay(period/4);
-		indicator.set(black);
+		setIndicator(0);
 		delay(period*3/4);
 	}
 }
 
 void wifiReady() {
-	indicator.set(readyColor);
+	if (currentIndicatorColor == connectingColor) {
+		setIndicator(readyColor, true);
+	}
+	SerPrintf("WIFI Ready.\n");
 }
+
+TaskHandle_t t;
 
 void setup() {
 	pinMode(indicatorPowerPin, OUTPUT);
 	digitalWrite(indicatorPowerPin, HIGH);
 
 	flashIndicator(flashColor, 20, 200);
-	indicator.set(startColor);
+	setIndicator(startColor, true);
 
-	Serial.begin(115200);
-	Serial.printf("Home-LED Startup\n");
+	SerBegin(115200);
+	SerPrintf("Home-LED Startup\n");
 
-	Serial.printf("Init HomeSpan\n");
+	SerPrintf("Init HomeSpan\n");
 	homeSpan.setSketchVersion(versionString);
 	homeSpan.setWifiCallback(wifiReady);
 	homeSpan.begin(Category::Bridges, "LED-Controller", DEFAULT_HOST_NAME, "LED-Controller-ESP32");
 
+	SerPrintf("Create devices\n");
 	createDevices();
 
-	indicator.set(connectingColor);
+	SerPrintf("Create dimmer task\n");
+	xTaskCreate(dimmerTask, "LED_Dimmer", dimmerTaskStackSize, NULL, 0, &t);
 
-	Serial.printf("Init complete.\n");
+	setIndicator(connectingColor, true);
+
+	SerPrintf("Init complete.\n");
 }
 
 void loop() {
 	homeSpan.poll();
+
+	// static uint32_t lastTime = 0;
+	// uint32_t curTime = millis();
+
+	// if ((curTime - lastTime) > 1000) {
+	// 	lastTime = curTime;
+	// 	UBaseType_t unused = uxTaskGetStackHighWaterMark(t);
+
+	// 	SerPrintf("Unused stack = %d\n", unused);
+	// }
 }
