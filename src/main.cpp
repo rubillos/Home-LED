@@ -324,14 +324,4 @@ void setup() {
 
 void loop() {
 	homeSpan.poll();
-
-	// static uint32_t lastTime = 0;
-	// uint32_t curTime = millis();
-
-	// if ((curTime - lastTime) > 1000) {
-	// 	lastTime = curTime;
-	// 	UBaseType_t unused = uxTaskGetStackHighWaterMark(t);
-
-	// 	SerPrintf("Unused stack = %d\n", unused);
-	// }
 }
