@@ -17,27 +17,36 @@ constexpr const char* versionString = "v0.2";
 
 //////////////////////////////////////////////
 
-typedef struct {
-    int16_t ledPin;
+typedef struct LEDDeviceRec {
+    uint8_t ledPin;
     int16_t buttonPin;
     const char* name;
     uint16_t fadeUpDuration;
     uint16_t fadeDownDuration;
     uint16_t fadeFastDuration;
+
+	LEDDeviceRec(const uint8_t ledPin, int16_t buttonPin, const char* name, uint16_t fadeUpDuration, uint16_t fadeDownDuration, uint16_t fadeFastDuration) : 
+				ledPin(ledPin), buttonPin(buttonPin), name(name), 
+				fadeUpDuration(fadeUpDuration), fadeDownDuration(fadeDownDuration), fadeFastDuration(fadeFastDuration) { }
+	LEDDeviceRec(const uint8_t ledPin, int16_t buttonPin, const char* name) : 
+				ledPin(ledPin), buttonPin(buttonPin), name(name), 
+				fadeUpDuration(0), fadeDownDuration(0), fadeFastDuration(0) { }
 } LEDDeviceRec;
 
 #ifdef TINYS3
 LEDDeviceRec deviceList[] = {
-    { 8, 36, "LED1", 0, 0, 0 },
+    { 8, 36, "LED1" },
 
-    // { 8, 6, "LED1", 0, 0, 0 },
-    // { 7, -1, "LED2", 0, 0, 0 },
+    // { 8, 6, "LED1" },
+    // { 7, -1, "LED2" },
 };
 #elif QTPYS3
 LEDDeviceRec deviceList[] = {
-    { MISO, 0, "LED1", 0, 0, 0 },
+    { MISO, 0, "LED1" },
 };
 #endif
+
+constexpr auto deviceCount = sizeof(deviceList) / sizeof(LEDDeviceRec);
 
 //////////////////////////////////////////////
 
@@ -85,15 +94,15 @@ Pixel indicator(indicatorDataPin);
 void setIndicator(uint32_t color, bool saveColor = false) {
 	if (color != currentIndicatorColor) {
 		currentIndicatorColor = color;
+		if (saveColor) {
+			savedIndicatorColor = color;
+		}
 		if (color & whiteColorFlag) {
 			color &= 0xFF;
 			indicator.set(Pixel::RGB(color, color, color));
 		}
 		else {
 			indicator.set(Pixel::RGB(color>>16, (color >> 8) & 0xFF, color & 0xFF));
-		}
-		if (saveColor) {
-			savedIndicatorColor = color;
 		}
 	}
 }
@@ -106,38 +115,17 @@ void setIndicator8(uint8_t color8) {
 
 typedef struct {
 	LedPin* led;
+
 	volatile float targetLevel = 0;
 	volatile float currentLevel = 0;
 	volatile float currentCorrectedLevel = 0;
 	volatile float levelStep = 0;
+
+	volatile float newTargetLevel = 0;
+	volatile float newLevelStep = 0;
 } DimInfoRec;
 
-typedef struct {
-	volatile DimInfoRec* dimInfo;
-	volatile float targetLevel;
-	volatile float levelStep;
-} DimCommandRec;
-
-constexpr auto deviceCount = sizeof(deviceList) / sizeof(LEDDeviceRec);
-
 DimInfoRec dimmerData[deviceCount];
-
-constexpr uint16_t commandQueueSize = 8;
-DimCommandRec commandQueue[commandQueueSize];
-volatile uint16_t commandQueueHead = 0;
-volatile uint16_t commandQueueTail = 0;
-
-void queueDimCommand(DimInfoRec* dimInfo, float targetLevel, float levelStep) {
-	uint16_t nextIndex = (commandQueueHead + 1) % commandQueueSize;
-
-	while (nextIndex == commandQueueTail) {}
-
-	DimCommandRec* command = &commandQueue[nextIndex];
-	command->dimInfo = dimInfo;
-	command->targetLevel = targetLevel;
-	command->levelStep = levelStep;
-	commandQueueHead = nextIndex;
-}
 
 //////////////////////////////////////////////
 
@@ -152,20 +140,16 @@ void dimmerTask(void* params) {
 	while (true) {
 		xTaskDelayUntil(&lastTicks, pdMS_TO_TICKS(ledUpdateRateInterval));
 
-		while (commandQueueTail != commandQueueHead) {
-			uint16_t nextIndex = (commandQueueTail + 1) % commandQueueSize;
-			DimCommandRec* command = &commandQueue[nextIndex];
-
-			command->dimInfo->targetLevel = command->targetLevel;
-			command->dimInfo->levelStep = command->levelStep;
-			commandQueueTail = nextIndex;
-		}
-
 		float firstValue = -1;
 
 		for (auto i=0; i<deviceCount; i++) {
 			DimInfoRec* dimInfo = &dimmerData[i];
 
+			if (dimInfo->newLevelStep != 0) {
+				dimInfo->targetLevel = dimInfo->newTargetLevel;
+				dimInfo->levelStep = dimInfo->newLevelStep;
+				dimInfo->newLevelStep = 0;
+			}
 			if (dimInfo->levelStep) {
 				dimInfo->currentLevel += dimInfo->levelStep;
 
@@ -242,7 +226,10 @@ struct DimmableLED : Service::LightBulb {
 				step = (newLevel >= currentLevel) ? _fadeUpStep : -_fadeDownStep;
 			}
 
-			queueDimCommand(_dimInfo, newLevel, step);
+			while (_dimInfo->newLevelStep != 0) {};
+
+			_dimInfo->newTargetLevel = newLevel;
+			_dimInfo->newLevelStep = step;
 		}
 	}
 
@@ -288,10 +275,19 @@ void flashIndicator(uint32_t color, uint16_t count, uint16_t period) {
 }
 
 void wifiReady() {
-	if (currentIndicatorColor == connectingColor) {
+	if (!(currentIndicatorColor & whiteColorFlag)) {
 		setIndicator(readyColor, true);
 	}
 	SerPrintf("WIFI Ready.\n");
+}
+
+void statusChanged(HS_STATUS status) {
+	if (status == HS_WIFI_CONNECTING) {
+		if (!(currentIndicatorColor & whiteColorFlag)) {
+			setIndicator(connectingColor, true);
+		}
+		SerPrintf("Lost WIFI Connection...\n");
+	}
 }
 
 TaskHandle_t t;
@@ -309,6 +305,7 @@ void setup() {
 	SerPrintf("Init HomeSpan\n");
 	homeSpan.setSketchVersion(versionString);
 	homeSpan.setWifiCallback(wifiReady);
+	homeSpan.setStatusCallback(statusChanged);
 	homeSpan.begin(Category::Bridges, "LED-Controller", DEFAULT_HOST_NAME, "LED-Controller-ESP32");
 
 	SerPrintf("Create devices\n");
