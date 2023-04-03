@@ -1,7 +1,9 @@
 #include "Arduino.h"
 
 #include "HomeSpan.h" 
-#include "extras/Pixel.h"
+#include "Wire.h"
+#include <Adafruit_NeoPixel.h>
+#include <Adafruit_DotStar.h>
 
 #ifdef DEBUG
 #define SerPrintf(...) Serial.printf(__VA_ARGS__)
@@ -13,50 +15,7 @@
 
 //////////////////////////////////////////////
 
-constexpr const char* versionString = "v0.2";
-
-//////////////////////////////////////////////
-
-typedef struct LEDDeviceRec {
-    uint8_t ledPin;
-    int16_t buttonPin;
-    const char* name;
-    uint16_t fadeUpDuration;
-    uint16_t fadeDownDuration;
-    uint16_t fadeFastDuration;
-
-	LEDDeviceRec(const uint8_t ledPin, int16_t buttonPin, const char* name, uint16_t fadeUpDuration, uint16_t fadeDownDuration, uint16_t fadeFastDuration) : 
-				ledPin(ledPin), buttonPin(buttonPin), name(name), 
-				fadeUpDuration(fadeUpDuration), fadeDownDuration(fadeDownDuration), fadeFastDuration(fadeFastDuration) { }
-	LEDDeviceRec(const uint8_t ledPin, int16_t buttonPin, const char* name) : 
-				ledPin(ledPin), buttonPin(buttonPin), name(name), 
-				fadeUpDuration(0), fadeDownDuration(0), fadeFastDuration(0) { }
-} LEDDeviceRec;
-
-#ifdef TINYS3
-LEDDeviceRec deviceList[] = {
-    { 8, 36, "LED1" },
-
-    // { 8, 6, "LED1" },
-    // { 7, -1, "LED2" },
-};
-#elif QTPYS3
-LEDDeviceRec deviceList[] = {
-    { MISO, 0, "LED1" },
-};
-#endif
-
-constexpr auto deviceCount = sizeof(deviceList) / sizeof(LEDDeviceRec);
-
-//////////////////////////////////////////////
-
-#ifdef TINYS3
-constexpr uint8_t indicatorDataPin = 18;
-constexpr uint8_t indicatorPowerPin = 17;
-#elif QTPYS3
-constexpr uint8_t indicatorDataPin = PIN_NEOPIXEL;
-constexpr uint8_t indicatorPowerPin = NEOPIXEL_POWER;
-#endif
+constexpr const char* versionString = "v0.3";
 
 //////////////////////////////////////////////
 
@@ -89,7 +48,149 @@ uint32_t savedIndicatorColor = 0;
 
 constexpr uint32_t whiteColorFlag = 1 << 24;
 
-Pixel indicator(indicatorDataPin);
+//////////////////////////////////////////////
+
+typedef enum {
+	Strip_RGB = 0,
+	Strip_RGBW,
+	Strip_W,
+
+	Strip_DotStar_RGB,
+	Strip_DotStar_W,
+
+	Strip_LED,
+
+	Strip_Switch,
+	Strip_Fan,
+} StripType;
+
+class SetValue {
+	public:
+		SetValue(StripType type=Strip_RGB) : _type(type) {};
+		virtual void setValue(float value) {};
+		uint32_t brightnessToColor(float value) {
+			switch (_type) {
+				case Strip_RGB:
+				case Strip_DotStar_RGB: {
+					uint8_t w = value / homeKitBrightnessMax * 255;
+					return w<<16 | w<<8 | w;
+				}
+				case Strip_RGBW: {
+					uint8_t w = value / homeKitBrightnessMax * 255;
+					return w<<24;
+				}
+				case Strip_W:
+				case Strip_DotStar_W: {
+					uint16_t w = value / homeKitBrightnessMax * 255 * 3;
+					uint8_t w1 = max(0, w-512);
+					uint8_t w2 = min(255, max(0, w-256));
+					uint8_t w3 = min(255, max(0, w-0));
+					return w1<<16 | w2<<8 | w3;
+				}
+				default:
+					return 0;
+					break;
+			}
+		};
+
+	private:
+		StripType _type;
+};
+
+class LedPinWithSetValue : public LedPin , public SetValue {
+	public:
+		LedPinWithSetValue(uint8_t pin, float level=0, uint16_t freq=DEFAULT_PWM_FREQ, boolean invert=false) : LedPin(pin, level, freq, invert) {};
+		void setValue(float value) { set(value); };
+};
+
+class PixelWithSetValue : public Adafruit_NeoPixel , public SetValue {
+	public:
+		PixelWithSetValue(int pin, int pixelCount, StripType type=Strip_RGB) : Adafruit_NeoPixel(pixelCount, pin, ((type==Strip_RGBW) ? NEO_GRBW : NEO_GRB) + NEO_KHZ800), SetValue(type) { };
+		void setValue(float value) {
+			fill(brightnessToColor(value));
+			show();
+		};
+};
+
+class DotWithSetValue : public Adafruit_DotStar , public SetValue {
+	public:
+		DotWithSetValue(uint8_t dataPin, uint8_t clockPin, int pixelCount, StripType type=Strip_RGB) : Adafruit_DotStar(pixelCount, dataPin, clockPin), SetValue(type) { };
+		void setValue(float value) {
+			fill(brightnessToColor(value));
+			show();
+		};
+};
+
+//////////////////////////////////////////////
+
+typedef struct LEDDeviceRec {
+	StripType type;
+	const char* name;
+	uint8_t outputPin;
+	int16_t buttonPin = -1;
+	int16_t clockPin = -1;
+	uint8_t count = 0;
+	uint16_t fadeUpDuration = 0;
+	uint16_t fadeDownDuration = 0;
+	uint16_t fadeFastDuration = 0;
+
+	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, int16_t buttonPin, uint16_t fadeUpDuration, uint16_t fadeDownDuration, uint16_t fadeFastDuration) : 
+				type(type), name(name), outputPin(outputPin), buttonPin(buttonPin), 
+				fadeUpDuration(fadeUpDuration), fadeDownDuration(fadeDownDuration), fadeFastDuration(fadeFastDuration) { }
+	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, uint8_t count, int16_t buttonPin, uint16_t fadeUpDuration, uint16_t fadeDownDuration, uint16_t fadeFastDuration) : 
+				type(type), name(name), outputPin(outputPin), count(count), buttonPin(buttonPin), 
+				fadeUpDuration(fadeUpDuration), fadeDownDuration(fadeDownDuration), fadeFastDuration(fadeFastDuration) { }
+	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, uint8_t count, int16_t clockPin, int16_t buttonPin, uint16_t fadeUpDuration, uint16_t fadeDownDuration, uint16_t fadeFastDuration) : 
+				type(type), name(name), outputPin(outputPin), count(count), clockPin(clockPin), buttonPin(buttonPin), 
+				fadeUpDuration(fadeUpDuration), fadeDownDuration(fadeDownDuration), fadeFastDuration(fadeFastDuration) { }
+	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, int16_t buttonPin) : 
+				type(type), name(name), outputPin(outputPin), buttonPin(buttonPin) { }
+	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, uint8_t count, int16_t buttonPin) : 
+				type(type), name(name), outputPin(outputPin), count(count), buttonPin(buttonPin) { }
+	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, uint8_t count, int16_t clockPin, int16_t buttonPin) : 
+				type(type), name(name), outputPin(outputPin), count(count), clockPin(clockPin), buttonPin(buttonPin) { }
+} LEDDeviceRec;
+
+// Strip_RGB/Strip_RGBW/Strip_W, "name", outputPin, buttonPin
+// Strip_RGB/Strip_RGBW/Strip_W, "name", outputPin, count, buttonPin
+// Strip_RGB/Strip_RGBW/Strip_W, "name", outputPin, buttonPin, fadeUpDuration, fadeDownDuration, fadeFastDuration
+// Strip_RGB/Strip_RGBW/Strip_W, "name", outputPin, count, buttonPin, fadeUpDuration, fadeDownDuration, fadeFastDuration
+//
+// Strip_Dotstar_RGB/Strip_DotStar_W, "name", "dataPin", count, clockPin, buttonPin
+// Strip_Dotstar_RGB/Strip_DotStar_W, "name", outputPin, count, clockPin, buttonPin, fadeUpDuration, fadeDownDuration, fadeFastDuration
+//
+// Strip_Switch, "name", outputPin, buttonPin
+// Strip_LED, "name", outputPin, buttonPin
+// Strip_Fan, "name", outputPin, unused, neoPixelPin, buttonPin
+
+#ifdef TINYS3
+LEDDeviceRec deviceList[] = {
+	// { Strip_RGB, "LED1", 8, 36 },
+
+	// { Strip_RGB, "LED1", 8, 6 },
+	// { Strip_RGB, "LED2", 7, -1 },
+
+	{ Strip_Fan, "Fan", 2, 0, 3, 4 },
+};
+#elif QTPYS3
+LEDDeviceRec deviceList[] = {
+	// { Strip_RGB, "LED1", MISO, 0 },
+};
+#endif
+
+constexpr auto deviceCount = sizeof(deviceList) / sizeof(LEDDeviceRec);
+
+//////////////////////////////////////////////
+
+#ifdef TINYS3
+constexpr uint8_t indicatorDataPin = 18;
+constexpr uint8_t indicatorPowerPin = 17;
+#elif QTPYS3
+constexpr uint8_t indicatorDataPin = PIN_NEOPIXEL;
+constexpr uint8_t indicatorPowerPin = NEOPIXEL_POWER;
+#endif
+
+Adafruit_NeoPixel indicator(1, indicatorDataPin);
 
 void setIndicator(uint32_t color, bool saveColor = false) {
 	if (color != currentIndicatorColor) {
@@ -99,11 +200,12 @@ void setIndicator(uint32_t color, bool saveColor = false) {
 		}
 		if (color & whiteColorFlag) {
 			color &= 0xFF;
-			indicator.set(Pixel::RGB(color, color, color));
+			indicator.setPixelColor(0, color, color, color);
 		}
 		else {
-			indicator.set(Pixel::RGB(color>>16, (color >> 8) & 0xFF, color & 0xFF));
+			indicator.setPixelColor(0, color>>16, (color >> 8) & 0xFF, color & 0xFF);
 		}
+		indicator.show();
 	}
 }
 
@@ -114,7 +216,7 @@ void setIndicator8(uint8_t color8) {
 //////////////////////////////////////////////
 
 typedef struct {
-	LedPin* led;
+	SetValue* led = NULL;
 
 	volatile float targetLevel = 0;
 	volatile float currentLevel = 0;
@@ -158,7 +260,9 @@ void dimmerTask(void* params) {
 					dimInfo->levelStep = 0;
 				}
 				dimInfo->currentCorrectedLevel = gammaCorrect(dimInfo->currentLevel);
-				dimInfo->led->set(dimInfo->currentCorrectedLevel);
+				if (dimInfo->led) {
+					dimInfo->led->setValue(dimInfo->currentCorrectedLevel);
+				}
 			}
 			if (firstValue==-1 && dimInfo->currentLevel>0) {
 				firstValue = dimInfo->currentCorrectedLevel;
@@ -201,7 +305,22 @@ struct DimmableLED : Service::LightBulb {
 		_brightness->setRange(0, 100, 1);
 
 		_dimInfo = dimInfo;
-		_dimInfo->led = new LedPin(device->ledPin, 0, 20000);
+
+		switch (device->type) {
+			case Strip_RGB:
+			case Strip_RGBW:
+			case Strip_W:
+				_dimInfo->led = new PixelWithSetValue(device->outputPin, device->count, device->type);
+				break;
+			case Strip_DotStar_RGB:
+			case Strip_DotStar_W:
+				_dimInfo->led = new DotWithSetValue(device->outputPin, device->clockPin, device->count, device->type);
+				break;
+			case Strip_LED:
+			default:
+				_dimInfo->led = new LedPinWithSetValue(device->outputPin, 0, 20000);
+				break;
+		}
 
 		_fadeUpStep = fadeStep(device->fadeUpDuration, defaultFadeUpTime);
 		_fadeDownStep = fadeStep(device->fadeDownDuration, defaultFadeDownTime);
@@ -251,15 +370,156 @@ struct DimmableLED : Service::LightBulb {
 };
 
 //////////////////////////////////////////////
+struct FanPWM : Service::Fan {
+	SetValue* _output;
+	SpanCharacteristic *_active;
+	SpanCharacteristic *_speed;
+	Adafruit_NeoPixel *_buttonLED = NULL;
+	SpanButton* _button = NULL;
+	DimInfoRec* _dimInfo;
+
+	FanPWM(LEDDeviceRec* device, DimInfoRec* dimInfo) : Service::Fan() {
+		_active = new Characteristic::Active(false);
+		_speed = new Characteristic::RotationSpeed(0, true);
+
+		_speed->setRange(0, 100, 25);
+
+		_dimInfo = dimInfo;
+		_output = new LedPinWithSetValue(device->outputPin, 0, 25000);
+
+		if (device->clockPin != -1) {
+			_buttonLED = new Adafruit_NeoPixel(1, device->clockPin, NEO_GRB + NEO_KHZ800);
+			_buttonLED->begin();
+			_buttonLED->show();
+		}
+
+		if (device->buttonPin != -1) {
+			_button = new SpanButton(device->buttonPin);
+		}
+
+		update();
+	}
+
+	boolean update() {
+		float newSpeed = _active->getNewVal() * _speed->getNewVal();
+		constexpr uint8_t ledBright = 30;
+		uint32_t color;
+
+		if (newSpeed < 5) {
+			color = MAKE_RGB(0, ledBright, 0);
+			newSpeed = 0;
+		}
+		else if (newSpeed < 37) {
+			color = MAKE_RGB(ledBright*4/10, ledBright*6/10, 0);
+			newSpeed = 25;
+		}
+		else if (newSpeed < 62) {
+			color = MAKE_RGB(ledBright*6/10, ledBright*4/10, 0);
+			newSpeed = 50;
+		}
+		else if (newSpeed < 95) {
+			color = MAKE_RGB(ledBright*8/10, ledBright*2/10, 0);
+			newSpeed = 75;
+		}
+		else {
+			color = MAKE_RGB(ledBright, 0, 0);
+			newSpeed = 100;
+		}
+		if (_buttonLED) {
+			_buttonLED->setPixelColor(0, color);
+			_buttonLED->show();
+		}
+		_output->setValue(newSpeed);
+		_dimInfo->currentLevel = newSpeed;
+		_dimInfo->currentCorrectedLevel = gammaCorrect(_dimInfo->currentLevel) * 0.1;
+
+		return true;
+	}
+
+	void button(int pin, int pressType) {
+		if (pressType == SpanButton::SINGLE) {
+			bool newActive = !_active->getVal();
+			_active->setVal(newActive);
+			if (newActive && _speed->getVal() == 0) {
+				_speed->setVal(100);
+			}
+			update();
+		}
+	}
+};
+
+//////////////////////////////////////////////
+struct DigitalPin : Service::Switch {
+	int _pin;
+	SpanButton* _button = NULL;
+	SpanCharacteristic *_on;
+	DimInfoRec* _dimInfo;
+
+	DigitalPin(LEDDeviceRec* device, DimInfoRec* dimInfo) : Service::Switch(){
+		_on = new Characteristic::On();
+		_pin = device->outputPin;
+		_dimInfo = dimInfo;
+		pinMode(_pin,OUTPUT);
+		digitalWrite(_pin, LOW);
+
+		if (device->buttonPin != -1) {
+			_button = new SpanButton(device->buttonPin);
+		}
+	}
+
+	boolean update() {            
+		bool value = _on->getNewVal();
+		digitalWrite(_pin, value);
+		_dimInfo->currentLevel = value * 100;
+		_dimInfo->currentCorrectedLevel = _dimInfo->currentLevel;
+		return(true);
+	}
+
+	void button(int pin, int pressType) {
+		if (pressType == SpanButton::SINGLE) {
+			_on->setVal(!_on->getVal());
+			update();
+		}
+	}
+};
+	  
+//////////////////////////////////////////////
 
 void createDevices() {
 	SPAN_ACCESSORY();   // create Bridge
 
 	for (auto i=0; i<deviceCount; i++) {
 		LEDDeviceRec* device = &deviceList[i];
-		SerPrintf("Creating \'%s\' on pin %d\n", device->name, device->ledPin);
+		DimInfoRec* dimInfo = &dimmerData[i];
+
+		SerPrintf("Creating \'%s\' on pin %d\n", device->name, device->outputPin);
+
 		SPAN_ACCESSORY(device->name);
-			new DimmableLED(device, &dimmerData[i]);
+			switch (device->type) {
+				case Strip_Switch:
+					new DigitalPin(device, dimInfo);
+					break;
+				case Strip_Fan:
+					new FanPWM(device, dimInfo);
+					break;
+				default:
+					new DimmableLED(device, dimInfo);
+					break;
+			}
+	}
+}
+
+void setInitialPins() {
+	for (auto i=0; i<deviceCount; i++) {
+		LEDDeviceRec* device = &deviceList[i];
+		switch (device->type) {
+			case Strip_Switch:
+			case Strip_Fan:
+			case Strip_LED:
+				pinMode(device->outputPin, OUTPUT);
+				digitalWrite(device->outputPin, LOW);
+				break;
+		}
 	}
 }
 
@@ -293,9 +553,12 @@ void statusChanged(HS_STATUS status) {
 TaskHandle_t t;
 
 void setup() {
+	setInitialPins();
+
 	pinMode(indicatorPowerPin, OUTPUT);
 	digitalWrite(indicatorPowerPin, HIGH);
 
+	indicator.begin();
 	flashIndicator(flashColor, 20, 200);
 	setIndicator(startColor, true);
 
@@ -313,6 +576,8 @@ void setup() {
 
 	SerPrintf("Create dimmer task\n");
 	xTaskCreate(dimmerTask, "LED_Dimmer", dimmerTaskStackSize, NULL, 0, &t);
+
+	SerPrintf("Wait for WiFi...\n");
 
 	setIndicator(connectingColor, true);
 
