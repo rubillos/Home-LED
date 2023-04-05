@@ -175,6 +175,8 @@ LEDDeviceRec deviceList[] = {
 #elif QTPYS3
 LEDDeviceRec deviceList[] = {
 	// { Strip_RGB, "LED1", MISO, 0 },
+
+	{ Strip_LED, "Penguin", SCK, 0 },
 };
 #endif
 
@@ -382,7 +384,7 @@ struct FanPWM : Service::Fan {
 		_active = new Characteristic::Active(false);
 		_speed = new Characteristic::RotationSpeed(0, true);
 
-		_speed->setRange(0, 100, 25);
+		_speed->setRange(0, 100, 1);
 
 		_dimInfo = dimInfo;
 		_output = new LedPinWithSetValue(device->outputPin, 0, 25000);
@@ -403,32 +405,25 @@ struct FanPWM : Service::Fan {
 	boolean update() {
 		float newSpeed = _active->getNewVal() * _speed->getNewVal();
 		constexpr uint8_t ledBright = 30;
-		uint32_t color;
+		uint32_t color = MAKE_RGB(0, ledBright, 0);
 
-		if (newSpeed < 5) {
-			color = MAKE_RGB(0, ledBright, 0);
-			newSpeed = 0;
+		if (newSpeed > 0) {
+			uint8_t rL = ledBright*6/10;
+			uint8_t rH = ledBright;
+			uint8_t gL = ledBright*6/10;
+			uint8_t gH = 0;
+			uint8_t r = rL + (rH - rL) * newSpeed / homeKitBrightnessMax;
+			uint8_t g = gL + (gH - gL) * newSpeed / homeKitBrightnessMax;
+
+			color = MAKE_RGB(r, g, 0);
+			newSpeed = 10 + 90 * newSpeed / homeKitBrightnessMax;
 		}
-		else if (newSpeed < 37) {
-			color = MAKE_RGB(ledBright*4/10, ledBright*6/10, 0);
-			newSpeed = 25;
-		}
-		else if (newSpeed < 62) {
-			color = MAKE_RGB(ledBright*6/10, ledBright*4/10, 0);
-			newSpeed = 50;
-		}
-		else if (newSpeed < 95) {
-			color = MAKE_RGB(ledBright*8/10, ledBright*2/10, 0);
-			newSpeed = 75;
-		}
-		else {
-			color = MAKE_RGB(ledBright, 0, 0);
-			newSpeed = 100;
-		}
+
 		if (_buttonLED) {
 			_buttonLED->setPixelColor(0, color);
 			_buttonLED->show();
 		}
+
 		_output->setValue(newSpeed);
 		_dimInfo->currentLevel = newSpeed;
 		_dimInfo->currentCorrectedLevel = gammaCorrect(_dimInfo->currentLevel) * 0.1;
