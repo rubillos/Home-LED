@@ -4,8 +4,39 @@
 #include "Wire.h"
 #include <Adafruit_NeoPixel.h>
 #include <Adafruit_DotStar.h>
+#include "ESPTelnetStream.h"
 
-#ifdef DEBUG
+//////////////////////////////////////////////
+
+class TelnetOutput : public ESPTelnetStream {
+	public:
+		size_t write(const uint8_t *buffer, size_t size) {
+			Serial.write(buffer, size);
+  			if (client && isConnected()) {
+				size_t result = client.write(buffer, size);
+				uint8_t c = buffer[size-1];
+				if (c == 13) {
+					client.write(10);
+				}
+				else if (c == 10) {
+					client.write(13);
+				}
+				return result;
+			}
+			else {
+				return -1;
+			}
+		}
+		size_t write(uint8_t c) {
+			return write(&c, 1);
+		}
+};
+
+TelnetOutput telnet;
+
+//////////////////////////////////////////////
+
+#if defined(OTADEBUG) || defined(DEBUG)
 #define SerPrintf(...) Serial.printf(__VA_ARGS__)
 #define SerBegin(...) Serial.begin(__VA_ARGS__)
 #else
@@ -15,7 +46,7 @@
 
 //////////////////////////////////////////////
 
-constexpr const char* versionString = "v0.3";
+constexpr const char* versionString = "v0.4";
 
 //////////////////////////////////////////////
 
@@ -33,15 +64,16 @@ constexpr uint32_t dimmerTaskStackSize = 2000;
 //////////////////////////////////////////////
 
 constexpr float ledGamma = 2.8;
-constexpr uint8_t maxIndicatorValue = 50;
+constexpr uint8_t maxIndicatorValue = 20;
 
-constexpr uint8_t ledStatusLevel = 0x03;
+constexpr uint8_t ledStatusLevel = 0x01;
 
 #define MAKE_RGB(r, g, b) (r<<16 | g<<8 | b)
 constexpr uint32_t flashColor = MAKE_RGB(ledStatusLevel, 0, ledStatusLevel);
 constexpr uint32_t startColor = MAKE_RGB(ledStatusLevel, 0, 0);
 constexpr uint32_t connectingColor = MAKE_RGB(0, 0, ledStatusLevel);
 constexpr uint32_t readyColor = MAKE_RGB(0, ledStatusLevel, 0);
+constexpr uint32_t telnetColor = MAKE_RGB(0, ledStatusLevel, ledStatusLevel);
 
 uint32_t currentIndicatorColor = 0xFFFFFFFF;
 uint32_t savedIndicatorColor = 0;
@@ -51,36 +83,40 @@ constexpr uint32_t whiteColorFlag = 1 << 24;
 //////////////////////////////////////////////
 
 typedef enum {
-	Strip_RGB = 0,
-	Strip_RGBW,
-	Strip_W,
+	Device_RGB = 0,
+	Device_RGBW,
+	Device_W,
 
-	Strip_DotStar_RGB,
-	Strip_DotStar_W,
+	Device_DotStar_RGB,
+	Device_DotStar_W,
 
-	Strip_LED,
+	Device_LED,
 
-	Strip_Switch,
-	Strip_Fan,
+	Device_Switch,
+	Device_Fan,
+
+	Device_Button,
 } StripType;
+
+constexpr uint16_t SwitchToggleBit = 0x4000;
 
 class SetValue {
 	public:
-		SetValue(StripType type=Strip_RGB) : _type(type) {};
+		SetValue(StripType type=Device_RGB) : _type(type) {};
 		virtual void setValue(float value) {};
 		uint32_t brightnessToColor(float value) {
 			switch (_type) {
-				case Strip_RGB:
-				case Strip_DotStar_RGB: {
+				case Device_RGB:
+				case Device_DotStar_RGB: {
 					uint8_t w = value / homeKitBrightnessMax * 255;
 					return w<<16 | w<<8 | w;
 				}
-				case Strip_RGBW: {
+				case Device_RGBW: {
 					uint8_t w = value / homeKitBrightnessMax * 255;
 					return w<<24;
 				}
-				case Strip_W:
-				case Strip_DotStar_W: {
+				case Device_W:
+				case Device_DotStar_W: {
 					uint16_t w = value / homeKitBrightnessMax * 255 * 3;
 					uint8_t w1 = max(0, w-512);
 					uint8_t w2 = min(255, max(0, w-256));
@@ -105,7 +141,7 @@ class LedPinWithSetValue : public LedPin , public SetValue {
 
 class PixelWithSetValue : public Adafruit_NeoPixel , public SetValue {
 	public:
-		PixelWithSetValue(int pin, int pixelCount, StripType type=Strip_RGB) : Adafruit_NeoPixel(pixelCount, pin, ((type==Strip_RGBW) ? NEO_GRBW : NEO_GRB) + NEO_KHZ800), SetValue(type) { };
+		PixelWithSetValue(int pin, int pixelCount, StripType type=Device_RGB) : Adafruit_NeoPixel(pixelCount, pin, ((type==Device_RGBW) ? NEO_GRBW : NEO_GRB) + NEO_KHZ800), SetValue(type) { };
 		void setValue(float value) {
 			fill(brightnessToColor(value));
 			show();
@@ -114,7 +150,7 @@ class PixelWithSetValue : public Adafruit_NeoPixel , public SetValue {
 
 class DotWithSetValue : public Adafruit_DotStar , public SetValue {
 	public:
-		DotWithSetValue(uint8_t dataPin, uint8_t clockPin, int pixelCount, StripType type=Strip_RGB) : Adafruit_DotStar(pixelCount, dataPin, clockPin), SetValue(type) { };
+		DotWithSetValue(uint8_t dataPin, uint8_t clockPin, int pixelCount, StripType type=Device_RGB) : Adafruit_DotStar(pixelCount, dataPin, clockPin), SetValue(type) { };
 		void setValue(float value) {
 			fill(brightnessToColor(value));
 			show();
@@ -149,36 +185,72 @@ typedef struct LEDDeviceRec {
 				type(type), name(name), outputPin(outputPin), count(count), buttonPin(buttonPin) { }
 	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, uint8_t count, int16_t clockPin, int16_t buttonPin) : 
 				type(type), name(name), outputPin(outputPin), count(count), clockPin(clockPin), buttonPin(buttonPin) { }
+	LEDDeviceRec(StripType type, const char* name, const int16_t buttonPin) :
+				type(type), name(name), buttonPin(buttonPin) { }
 } LEDDeviceRec;
 
-// Strip_RGB/Strip_RGBW/Strip_W, "name", outputPin, buttonPin
-// Strip_RGB/Strip_RGBW/Strip_W, "name", outputPin, count, buttonPin
-// Strip_RGB/Strip_RGBW/Strip_W, "name", outputPin, buttonPin, fadeUpDuration, fadeDownDuration, fadeFastDuration
-// Strip_RGB/Strip_RGBW/Strip_W, "name", outputPin, count, buttonPin, fadeUpDuration, fadeDownDuration, fadeFastDuration
+// Device_RGB/Device_RGBW/Device_W,Device_LED, "name", outputPin, buttonPin
+// Device_RGB/Device_RGBW/Device_W,Device_LED, "name", outputPin, count, buttonPin
+// Device_RGB/Device_RGBW/Device_W,Device_LED, "name", outputPin, buttonPin, fadeUpDuration, fadeDownDuration, fadeFastDuration
+// Device_RGB/Device_RGBW/Device_W,Device_LED, "name", outputPin, count, buttonPin, fadeUpDuration, fadeDownDuration, fadeFastDuration
 //
-// Strip_Dotstar_RGB/Strip_DotStar_W, "name", "dataPin", count, clockPin, buttonPin
-// Strip_Dotstar_RGB/Strip_DotStar_W, "name", outputPin, count, clockPin, buttonPin, fadeUpDuration, fadeDownDuration, fadeFastDuration
+// Device_Dotstar_RGB/Device_DotStar_W, "name", "dataPin", count, clockPin, buttonPin
+// Device_Dotstar_RGB/Device_DotStar_W, "name", outputPin, count, clockPin, buttonPin, fadeUpDuration, fadeDownDuration, fadeFastDuration
 //
-// Strip_Switch, "name", outputPin, buttonPin
-// Strip_LED, "name", outputPin, buttonPin
-// Strip_Fan, "name", outputPin, unused, neoPixelPin, buttonPin
+// Device_Switch, "name", outputPin, buttonPin
+// Device_LED, "name", outputPin, buttonPin
+// Device_Fan, "name", outputPin, unused, neoPixelPin, buttonPin
+//
+// Device_Button, "name", buttonPin
 
 #ifdef TINYS3
+// LEDDeviceRec deviceList[] = {
+// 	{ Device_RGB, "LED1", 8, 6 },
+// };
+// LEDDeviceRec deviceList[] = {
+// 	{ Device_RGB, "LED2", 7, -1 },
+// };
+
+// Penguin Express Top Lighting Strip
+// constexpr const char* displayName = "LED-Controller";
+// constexpr const char* modelName = "LED-Controller-ESP32";
+// LEDDeviceRec deviceList[] = {
+// 	{ Device_LED, "LED", 8, 36 },
+// 	{ Device_Button, "Button", 37 },
+// };
+
+constexpr const char* displayName = "Fan-Controller";
+constexpr const char* modelName = "Fan-Controller-LR";
 LEDDeviceRec deviceList[] = {
-	// { Strip_RGB, "LED1", 8, 36 },
-
-	// { Strip_RGB, "LED1", 8, 6 },
-	// { Strip_RGB, "LED2", 7, -1 },
-
-	{ Strip_Fan, "Fan", 2, 0, 3, 4 },
+	{ Device_Fan, "Fan", 2, 0, 3, 4 },
 };
+
 #elif QTPYS3
-LEDDeviceRec deviceList[] = {
-	// { Strip_RGB, "LED1", MISO, 0 },
+// Penguin Light
+// constexpr const char* displayName = "Penguin-Controller";
+// constexpr const char* modelName = "Penguin-Controller-ESP32";
+// LEDDeviceRec deviceList[] = {
+// 	{ Device_LED, "Penguin", SCK, 0 },
+// };
 
-	{ Strip_LED, "Penguin", SCK, 0 },
+// Penguin Express Lower Accent Lighting
+constexpr const char* displayName = "Accent-Controller";
+constexpr const char* modelName = "Accent-Controller-ESP32";
+LEDDeviceRec deviceList[] = {
+	{ Device_LED, "Lower Accent", MISO, 0 },
 };
+
+// Penguin Express Dining Lighting
+// constexpr const char* displayName = "Dining-Controller";
+// constexpr const char* modelName = "Dining-Controller-ESP32";
+// LEDDeviceRec deviceList[] = {
+// 	{ Device_LED, "LED-Left", MOSI, SCK | SwitchToggleBit, 100, 800, defaultFadeFastTime },
+// 	{ Device_LED, "LED-Right", MISO, RX | SwitchToggleBit, 100, 800, defaultFadeFastTime },
+// };
+
 #endif
+
+constexpr const char* otaPassword = "seattle";
 
 constexpr auto deviceCount = sizeof(deviceList) / sizeof(LEDDeviceRec);
 
@@ -217,6 +289,47 @@ void setIndicator8(uint8_t color8) {
 
 //////////////////////////////////////////////
 
+uint64_t millis64() {
+  static uint32_t low32 = 0, high32 = 0;
+  uint32_t new_low32 = millis();
+
+  if (new_low32 < low32)
+    high32++;
+
+  low32 = new_low32;
+
+  return (uint64_t) high32 << 32 | low32;
+}
+
+class elapsedMillis64
+{
+  private:
+    uint64_t ms;
+  public:
+    elapsedMillis64(void) { ms = millis64(); }
+    elapsedMillis64(uint64_t val) { ms = millis64() - val; }
+    elapsedMillis64(const elapsedMillis64 &orig) { ms = orig.ms; }
+    operator uint64_t () const { return millis64() - ms; }
+    elapsedMillis64 & operator = (const elapsedMillis64 &rhs) { ms = rhs.ms; return *this; }
+    elapsedMillis64 & operator = (uint64_t val)       { ms = millis64() - val; return *this; }
+    elapsedMillis64 & operator -= (uint64_t val)      { ms += val ; return *this; }
+    elapsedMillis64 & operator += (uint64_t val)      { ms -= val ; return *this; }
+    elapsedMillis64 operator - (int val) const            { elapsedMillis64 r(*this); r.ms += val; return r; }
+    elapsedMillis64 operator - (unsigned int val) const   { elapsedMillis64 r(*this); r.ms += val; return r; }
+    elapsedMillis64 operator - (long val) const           { elapsedMillis64 r(*this); r.ms += val; return r; }
+    elapsedMillis64 operator - (unsigned long val) const  { elapsedMillis64 r(*this); r.ms += val; return r; }
+    elapsedMillis64 operator - (int64_t val) const        { elapsedMillis64 r(*this); r.ms += val; return r; }
+    elapsedMillis64 operator - (uint64_t val) const       { elapsedMillis64 r(*this); r.ms += val; return r; }
+    elapsedMillis64 operator + (int val) const            { elapsedMillis64 r(*this); r.ms -= val; return r; }
+    elapsedMillis64 operator + (unsigned int val) const   { elapsedMillis64 r(*this); r.ms -= val; return r; }
+    elapsedMillis64 operator + (long val) const           { elapsedMillis64 r(*this); r.ms -= val; return r; }
+    elapsedMillis64 operator + (unsigned long val) const  { elapsedMillis64 r(*this); r.ms -= val; return r; }
+    elapsedMillis64 operator + (int64_t val) const        { elapsedMillis64 r(*this); r.ms -= val; return r; }
+    elapsedMillis64 operator + (uint64_t val) const       { elapsedMillis64 r(*this); r.ms -= val; return r; }
+};
+
+//////////////////////////////////////////////
+
 typedef struct {
 	SetValue* led = NULL;
 
@@ -240,6 +353,7 @@ inline float gammaCorrect(float value) {
 void dimmerTask(void* params) {
 	TickType_t lastTicks = xTaskGetTickCount();
 	float currentIndicatorValue = -1;
+	elapsedMillis64 lastChange;
 
 	while (true) {
 		xTaskDelayUntil(&lastTicks, pdMS_TO_TICKS(ledUpdateRateInterval));
@@ -271,13 +385,24 @@ void dimmerTask(void* params) {
 			}
 		}
 
+		constexpr uint32_t indicatorOutTime = 5 * 60 * 1000;
+
+		if (firstValue == -1 && lastChange > indicatorOutTime) {
+			firstValue = -2;
+		}
+
 		if (firstValue != currentIndicatorValue) {
 			if (firstValue == -1) {
 				setIndicator(savedIndicatorColor);
+				lastChange = 0;
+			}
+			else if (firstValue == -2) {
+				setIndicator(0);
 			}
 			else {
 				uint8_t value255 = firstValue * maxIndicatorValue / homeKitBrightnessMax;
 				setIndicator8(max((uint8_t)1, value255));
+				lastChange = 0;
 			}
 			currentIndicatorValue = firstValue;
 		}
@@ -309,16 +434,16 @@ struct DimmableLED : Service::LightBulb {
 		_dimInfo = dimInfo;
 
 		switch (device->type) {
-			case Strip_RGB:
-			case Strip_RGBW:
-			case Strip_W:
+			case Device_RGB:
+			case Device_RGBW:
+			case Device_W:
 				_dimInfo->led = new PixelWithSetValue(device->outputPin, device->count, device->type);
 				break;
-			case Strip_DotStar_RGB:
-			case Strip_DotStar_W:
+			case Device_DotStar_RGB:
+			case Device_DotStar_W:
 				_dimInfo->led = new DotWithSetValue(device->outputPin, device->clockPin, device->count, device->type);
 				break;
-			case Strip_LED:
+			case Device_LED:
 			default:
 				_dimInfo->led = new LedPinWithSetValue(device->outputPin, 0, 20000);
 				break;
@@ -329,7 +454,12 @@ struct DimmableLED : Service::LightBulb {
 		_fadeFastStep = fadeStep(device->fadeFastDuration, defaultFadeFastTime);
 
 		if (device->buttonPin != -1) {
-			_button = new SpanButton(device->buttonPin);
+			if (device->buttonPin & SwitchToggleBit) {
+				_button = new SpanToggle(device->buttonPin);
+			}
+			else {
+				_button = new SpanButton(device->buttonPin);
+			}
 		}
 	}
 
@@ -396,7 +526,12 @@ struct FanPWM : Service::Fan {
 		}
 
 		if (device->buttonPin != -1) {
-			_button = new SpanButton(device->buttonPin);
+			if (device->buttonPin & SwitchToggleBit) {
+				_button = new SpanToggle(device->buttonPin);
+			}
+			else {
+				_button = new SpanButton(device->buttonPin);
+			}
 		}
 
 		update();
@@ -405,7 +540,7 @@ struct FanPWM : Service::Fan {
 	boolean update() {
 		float newSpeed = _active->getNewVal() * _speed->getNewVal();
 		constexpr uint8_t ledBright = 30;
-		uint32_t color = MAKE_RGB(0, ledBright, 0);
+		uint32_t color = MAKE_RGB(0, ledBright/3, 0);
 
 		if (newSpeed > 0) {
 			uint8_t rL = ledBright*6/10;
@@ -458,7 +593,12 @@ struct DigitalPin : Service::Switch {
 		digitalWrite(_pin, LOW);
 
 		if (device->buttonPin != -1) {
-			_button = new SpanButton(device->buttonPin);
+			if (device->buttonPin & SwitchToggleBit) {
+				_button = new SpanToggle(device->buttonPin);
+			}
+			else {
+				_button = new SpanButton(device->buttonPin);
+			}
 		}
 	}
 
@@ -480,6 +620,22 @@ struct DigitalPin : Service::Switch {
 	  
 //////////////////////////////////////////////
 
+struct HomeButton : Service::StatelessProgrammableSwitch {
+	SpanCharacteristic* _switchEvent;
+	SpanButton* _button;
+  
+	HomeButton(LEDDeviceRec* device, DimInfoRec* dimInfo) : Service::StatelessProgrammableSwitch() {
+		_switchEvent = new Characteristic::ProgrammableSwitchEvent();
+		_button = new SpanButton(device->buttonPin);
+	}
+
+	void button(int pin, int pressType) override {
+		_switchEvent->setVal(pressType);
+	}
+};
+
+//////////////////////////////////////////////
+
 void createDevices() {
 	SPAN_ACCESSORY();   // create Bridge
 
@@ -491,11 +647,14 @@ void createDevices() {
 
 		SPAN_ACCESSORY(device->name);
 			switch (device->type) {
-				case Strip_Switch:
+				case Device_Switch:
 					new DigitalPin(device, dimInfo);
 					break;
-				case Strip_Fan:
+				case Device_Fan:
 					new FanPWM(device, dimInfo);
+					break;
+				case Device_Button:
+					new HomeButton(device, dimInfo);
 					break;
 				default:
 					new DimmableLED(device, dimInfo);
@@ -508,14 +667,28 @@ void setInitialPins() {
 	for (auto i=0; i<deviceCount; i++) {
 		LEDDeviceRec* device = &deviceList[i];
 		switch (device->type) {
-			case Strip_Switch:
-			case Strip_Fan:
-			case Strip_LED:
+			case Device_Switch:
+			case Device_Fan:
+			case Device_LED:
 				pinMode(device->outputPin, OUTPUT);
 				digitalWrite(device->outputPin, LOW);
 				break;
 		}
 	}
+}
+
+//////////////////////////////////////////////
+
+void telnetConnected(String ip) {
+  SerPrintf("%s connected.\n", ip);
+  setIndicator(telnetColor, true);
+  homeSpan.outputStream = &telnet;
+}
+
+void telnetDisconnected(String ip) {
+  SerPrintf("%s disconnected.\n", ip);
+  setIndicator(readyColor, true);
+  homeSpan.outputStream = &Serial;
 }
 
 //////////////////////////////////////////////
@@ -529,19 +702,29 @@ void flashIndicator(uint32_t color, uint16_t count, uint16_t period) {
 	}
 }
 
-void wifiReady() {
-	if (!(currentIndicatorColor & whiteColorFlag)) {
-		setIndicator(readyColor, true);
-	}
-	SerPrintf("WIFI Ready.\n");
-}
-
 void statusChanged(HS_STATUS status) {
 	if (status == HS_WIFI_CONNECTING) {
 		if (!(currentIndicatorColor & whiteColorFlag)) {
 			setIndicator(connectingColor, true);
 		}
 		SerPrintf("Lost WIFI Connection...\n");
+	}
+}
+
+void wifiReady() {
+	if (!(currentIndicatorColor & whiteColorFlag)) {
+		setIndicator(readyColor, true);
+	}
+	SerPrintf("WIFI Ready.\n");
+
+	SerPrintf("Telnet.begin: ");
+	telnet.onConnect(telnetConnected);
+	telnet.onDisconnect(telnetDisconnected);
+	telnet.onReconnect(telnetConnected);
+	if(telnet.begin()) {
+		SerPrintf("Successful\n");
+	} else {
+		SerPrintf("Failed\n");
 	}
 }
 
@@ -557,14 +740,15 @@ void setup() {
 	flashIndicator(flashColor, 20, 200);
 	setIndicator(startColor, true);
 
-	SerBegin(115200);
+	Serial.begin(115200);
 	SerPrintf("Home-LED Startup\n");
 
 	SerPrintf("Init HomeSpan\n");
 	homeSpan.setSketchVersion(versionString);
 	homeSpan.setWifiCallback(wifiReady);
 	homeSpan.setStatusCallback(statusChanged);
-	homeSpan.begin(Category::Bridges, "LED-Controller", DEFAULT_HOST_NAME, "LED-Controller-ESP32");
+	homeSpan.enableOTA(otaPassword);
+	homeSpan.begin(Category::Bridges, displayName, DEFAULT_HOST_NAME, modelName);
 
 	SerPrintf("Create devices\n");
 	createDevices();
@@ -580,5 +764,6 @@ void setup() {
 }
 
 void loop() {
+	telnet.loop();
 	homeSpan.poll();
 }
