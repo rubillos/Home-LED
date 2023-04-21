@@ -508,8 +508,10 @@ class SpanCharacteristic{
   }
 
   void uvSet(UVal &u, const char *val){
-    u.STRING = (char *)realloc(u.STRING, strlen(val) + 1);
-    strcpy(u.STRING, val);
+    if (val) {
+      u.STRING = (char *)realloc(u.STRING, strlen(val) + 1);
+      strcpy(u.STRING, val);
+    }
   }
 
   template <typename T> void uvSet(UVal &u, T val){  
