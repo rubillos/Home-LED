@@ -5,44 +5,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <Adafruit_DotStar.h>
 #include "ESPTelnetStream.h"
-
-//////////////////////////////////////////////
-
-class TelnetOutput : public ESPTelnetStream {
-	public:
-		size_t write(const uint8_t *buffer, size_t size) {
-			Serial.write(buffer, size);
-  			if (client && isConnected()) {
-				size_t result = client.write(buffer, size);
-				uint8_t c = buffer[size-1];
-				if (c == 13) {
-					client.write(10);
-				}
-				else if (c == 10) {
-					client.write(13);
-				}
-				return result;
-			}
-			else {
-				return -1;
-			}
-		}
-		size_t write(uint8_t c) {
-			return write(&c, 1);
-		}
-};
-
-TelnetOutput telnet;
-
-//////////////////////////////////////////////
-
-#if defined(OTADEBUG) || defined(DEBUG)
-#define SerPrintf(...) Serial.printf(__VA_ARGS__)
-#define SerBegin(...) Serial.begin(__VA_ARGS__)
-#else
-#define SerPrintf(...)
-#define SerBegin(...)
-#endif
+#include "driver/temp_sensor.h"
 
 //////////////////////////////////////////////
 
@@ -57,9 +20,11 @@ constexpr uint32_t defaultFadeUpTime = 500;
 constexpr uint32_t defaultFadeDownTime = 2000;
 constexpr uint32_t defaultFadeFastTime = 300;
 
+constexpr uint32_t indicatorOffTime = 30 * 1000;
+
 constexpr float homeKitBrightnessMax = 100.0;
 
-constexpr uint32_t dimmerTaskStackSize = 2000;
+constexpr uint32_t dimmerTaskStackSize = 3000;
 
 //////////////////////////////////////////////
 
@@ -82,6 +47,79 @@ constexpr uint32_t whiteColorFlag = 1 << 24;
 
 //////////////////////////////////////////////
 
+constexpr uint16_t telnetBufferSize = 200;
+constexpr uint16_t telnetBufferPadding = 4;
+constexpr uint16_t telnetBufferMax = telnetBufferSize - telnetBufferPadding;
+constexpr uint32_t telnetFlushDelay = 100;
+
+constexpr uint8_t lfCode = 10;
+constexpr uint8_t crCode = 13;
+
+class BufferedTelnetOutput : public ESPTelnetStream {
+	private:
+		uint8_t outputBuffer[telnetBufferSize];
+		uint16_t outputIndex = 0;
+		uint32_t lastOutputTime = 0;
+
+		void flushBuffer() {
+			if (outputIndex > 0) {
+				if (client && isConnected()) {
+					client.write(outputBuffer, outputIndex);
+				}
+				outputIndex = 0;
+			}
+		}
+
+		void pushByte(uint8_t c) {
+			outputBuffer[outputIndex++] = c;
+			if (c == lfCode) {
+				c = crCode;
+				outputBuffer[outputIndex++] = c;
+			}
+			if (c==crCode || outputIndex>telnetBufferMax) {
+				flushBuffer();
+			}
+		}
+
+	public:
+		size_t write(const uint8_t *buffer, size_t size) {
+			lastOutputTime = millis();
+			Serial.write(buffer, size);
+  			if (client && isConnected()) {
+				for (auto i=0; i<size; i++) {
+					pushByte(buffer[i]);
+				}
+			}
+			return size;
+		}
+
+		size_t write(uint8_t c) {
+			return write(&c, 1);
+		}	
+
+		void flushAfterDelay() {
+			if (outputIndex > 0) {
+				if ((millis() - lastOutputTime) > telnetFlushDelay) {
+					flushBuffer();
+				}
+			}
+		}
+};
+
+BufferedTelnetOutput telnet;
+
+//////////////////////////////////////////////
+
+#if defined(OTADEBUG) || defined(DEBUG)
+#define SerPrintf(...) Serial.printf(__VA_ARGS__)
+#define SerBegin(...) Serial.begin(__VA_ARGS__)
+#else
+#define SerPrintf(...)
+#define SerBegin(...)
+#endif
+
+//////////////////////////////////////////////
+
 typedef enum {
 	Device_RGB = 0,
 	Device_RGBW,
@@ -99,6 +137,17 @@ typedef enum {
 } StripType;
 
 constexpr uint16_t SwitchToggleBit = 0x4000;
+constexpr uint16_t SwitchForceFullBit = 0x2000;
+constexpr uint16_t SwitchGroupMask = 0x1C00;
+constexpr uint16_t SwitchGroupShift = 10;
+constexpr uint16_t SwitchPinMask = 0x03FF;
+
+constexpr uint32_t SwitchDoublePressTime = 500;
+
+#define SWITCH_GROUP_BITS(groupID) (groupID << SwitchGroupShift)
+#define SWITCH_GROUP_ID(buttonPin) ((buttonPin & SwitchGroupMask) >> SwitchGroupShift)
+
+//////////////////////////////////////////////
 
 class SetValue {
 	public:
@@ -174,17 +223,17 @@ typedef struct LEDDeviceRec {
 				type(type), name(name), outputPin(outputPin), buttonPin(buttonPin), 
 				fadeUpDuration(fadeUpDuration), fadeDownDuration(fadeDownDuration), fadeFastDuration(fadeFastDuration) { }
 	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, uint8_t count, int16_t buttonPin, uint16_t fadeUpDuration, uint16_t fadeDownDuration, uint16_t fadeFastDuration) : 
-				type(type), name(name), outputPin(outputPin), count(count), buttonPin(buttonPin), 
+				type(type), name(name), outputPin(outputPin), buttonPin(buttonPin), count(count), 
 				fadeUpDuration(fadeUpDuration), fadeDownDuration(fadeDownDuration), fadeFastDuration(fadeFastDuration) { }
 	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, uint8_t count, int16_t clockPin, int16_t buttonPin, uint16_t fadeUpDuration, uint16_t fadeDownDuration, uint16_t fadeFastDuration) : 
-				type(type), name(name), outputPin(outputPin), count(count), clockPin(clockPin), buttonPin(buttonPin), 
+				type(type), name(name), outputPin(outputPin), buttonPin(buttonPin), clockPin(clockPin), count(count), 
 				fadeUpDuration(fadeUpDuration), fadeDownDuration(fadeDownDuration), fadeFastDuration(fadeFastDuration) { }
 	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, int16_t buttonPin) : 
 				type(type), name(name), outputPin(outputPin), buttonPin(buttonPin) { }
 	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, uint8_t count, int16_t buttonPin) : 
-				type(type), name(name), outputPin(outputPin), count(count), buttonPin(buttonPin) { }
+				type(type), name(name), outputPin(outputPin), buttonPin(buttonPin), count(count) { }
 	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, uint8_t count, int16_t clockPin, int16_t buttonPin) : 
-				type(type), name(name), outputPin(outputPin), count(count), clockPin(clockPin), buttonPin(buttonPin) { }
+				type(type), name(name), outputPin(outputPin), buttonPin(buttonPin), clockPin(clockPin), count(count) { }
 	LEDDeviceRec(StripType type, const char* name, const int16_t buttonPin) :
 				type(type), name(name), buttonPin(buttonPin) { }
 } LEDDeviceRec;
@@ -203,50 +252,79 @@ typedef struct LEDDeviceRec {
 //
 // Device_Button, "name", buttonPin
 
-#ifdef TINYS3
-// LEDDeviceRec deviceList[] = {
-// 	{ Device_RGB, "LED1", 8, 6 },
-// };
-// LEDDeviceRec deviceList[] = {
-// 	{ Device_RGB, "LED2", 7, -1 },
-// };
+//////////////////////////////////////////////
+
+// #define PENGUIN_LIGHT
+// #define PNGXPRS_LOWER_ACCENT
+// #define PNGXPRS_UPPER_LED
+#define PNGXPRS_DINING
+// #define FAN_LR
+// #define FAN_BB
+
+#if defined(TINYS3)
+
+#if defined(PNGXPRS_UPPER_LED)
 
 // Penguin Express Top Lighting Strip
-// constexpr const char* displayName = "LED-Controller";
-// constexpr const char* modelName = "LED-Controller-ESP32";
-// LEDDeviceRec deviceList[] = {
-// 	{ Device_LED, "LED", 8, 36 },
-// 	{ Device_Button, "Button", 37 },
-// };
+constexpr const char* displayName = "Upper-LED-Controller";
+constexpr const char* modelName = "Upper-LED-Controller-ESP32";
+LEDDeviceRec deviceList[] = {
+	{ Device_LED, "LED", 8, 36 },
+	{ Device_Button, "Button", 37 },
+};
+#define CPU_FREQUENCY 80
+
+#elif defined(FAN_LR)
 
 constexpr const char* displayName = "Fan-Controller";
 constexpr const char* modelName = "Fan-Controller-LR";
 LEDDeviceRec deviceList[] = {
-	{ Device_Fan, "Fan", 2, 0, 3, 4 },
+	{ Device_Fan, "Fan", 2, 0, 3, 4 | SwitchForceFullBit },
 };
 
-#elif QTPYS3
-// Penguin Light
-// constexpr const char* displayName = "Penguin-Controller";
-// constexpr const char* modelName = "Penguin-Controller-ESP32";
-// LEDDeviceRec deviceList[] = {
-// 	{ Device_LED, "Penguin", SCK, 0 },
-// };
+#elif defined(FAN_BB)
+constexpr const char* displayName = "Fan-Controller";
+constexpr const char* modelName = "Fan-Controller-BB";
+LEDDeviceRec deviceList[] = {
+	{ Device_Fan, "Fan", 2, 0, 3, 4 | SwitchForceFullBit },
+};
 
-// Penguin Express Lower Accent Lighting
+#else
+#error No Device Definitions Found - Check build defines
+#endif
+
+#elif defined(QTPYS3)
+// Penguin Light
+#if defined(PENGUIN_LIGHT)
+
+constexpr const char* displayName = "Penguin-Controller";
+constexpr const char* modelName = "Penguin-Controller-ESP32";
+LEDDeviceRec deviceList[] = {
+	{ Device_LED, "Penguin", SCK, 0 },
+};
+
+#elif defined(PNGXPRS_LOWER_ACCENT)
+
 constexpr const char* displayName = "Accent-Controller";
 constexpr const char* modelName = "Accent-Controller-ESP32";
 LEDDeviceRec deviceList[] = {
 	{ Device_LED, "Lower Accent", MISO, 0 },
 };
+#define CPU_FREQUENCY 80
 
-// Penguin Express Dining Lighting
-// constexpr const char* displayName = "Dining-Controller";
-// constexpr const char* modelName = "Dining-Controller-ESP32";
-// LEDDeviceRec deviceList[] = {
-// 	{ Device_LED, "LED-Left", MOSI, SCK | SwitchToggleBit, 100, 800, defaultFadeFastTime },
-// 	{ Device_LED, "LED-Right", MISO, RX | SwitchToggleBit, 100, 800, defaultFadeFastTime },
-// };
+#elif defined(PNGXPRS_DINING)
+
+constexpr const char* displayName = "Dining-Controller";
+constexpr const char* modelName = "Dining-Controller-ESP32";
+LEDDeviceRec deviceList[] = {
+	{ Device_LED, "Left", MOSI, SCK | SwitchToggleBit | SwitchForceFullBit | SWITCH_GROUP_BITS(1), 100, 1000, defaultFadeFastTime },
+	{ Device_LED, "Right", MISO, RX | SwitchToggleBit | SwitchForceFullBit | SWITCH_GROUP_BITS(1), 100, 1000, defaultFadeFastTime },
+};
+#define CPU_FREQUENCY 80
+
+#else
+#error No Device Definitions Found - Check build defines
+#endif
 
 #endif
 
@@ -264,9 +342,30 @@ constexpr uint8_t indicatorDataPin = PIN_NEOPIXEL;
 constexpr uint8_t indicatorPowerPin = NEOPIXEL_POWER;
 #endif
 
-Adafruit_NeoPixel indicator(1, indicatorDataPin);
+uint64_t millis64() {
+  volatile static uint32_t low32 = 0, high32 = 0;
+  uint32_t new_low32 = millis();
 
-void setIndicator(uint32_t color, bool saveColor = false) {
+  if (new_low32 < low32)
+    high32++;
+
+  low32 = new_low32;
+
+  return (uint64_t) high32 << 32 | low32;
+}
+
+Adafruit_NeoPixel indicator(1, indicatorDataPin);
+volatile uint64_t lastIndicatorChange;
+bool indicatorPowered = false;
+
+void setIndicator(uint32_t color, bool saveColor = false, bool updateChanged = true) {
+	if (!indicatorPowered) {
+		pinMode(indicatorPowerPin, OUTPUT);
+		digitalWrite(indicatorPowerPin, HIGH);
+		indicatorPowered = true;
+		currentIndicatorColor = 0xFFFFFFFF;
+	}
+
 	if (color != currentIndicatorColor) {
 		currentIndicatorColor = color;
 		if (saveColor) {
@@ -280,6 +379,10 @@ void setIndicator(uint32_t color, bool saveColor = false) {
 			indicator.setPixelColor(0, color>>16, (color >> 8) & 0xFF, color & 0xFF);
 		}
 		indicator.show();
+
+		if (updateChanged) {
+			lastIndicatorChange = millis64();
+		}
 	}
 }
 
@@ -287,46 +390,12 @@ void setIndicator8(uint8_t color8) {
 	setIndicator(whiteColorFlag | color8);
 }
 
-//////////////////////////////////////////////
-
-uint64_t millis64() {
-  static uint32_t low32 = 0, high32 = 0;
-  uint32_t new_low32 = millis();
-
-  if (new_low32 < low32)
-    high32++;
-
-  low32 = new_low32;
-
-  return (uint64_t) high32 << 32 | low32;
+void powerOffIndicator() {
+	if (indicatorPowered) {
+		digitalWrite(indicatorPowerPin, LOW);
+		indicatorPowered = false;
+	}
 }
-
-class elapsedMillis64
-{
-  private:
-    uint64_t ms;
-  public:
-    elapsedMillis64(void) { ms = millis64(); }
-    elapsedMillis64(uint64_t val) { ms = millis64() - val; }
-    elapsedMillis64(const elapsedMillis64 &orig) { ms = orig.ms; }
-    operator uint64_t () const { return millis64() - ms; }
-    elapsedMillis64 & operator = (const elapsedMillis64 &rhs) { ms = rhs.ms; return *this; }
-    elapsedMillis64 & operator = (uint64_t val)       { ms = millis64() - val; return *this; }
-    elapsedMillis64 & operator -= (uint64_t val)      { ms += val ; return *this; }
-    elapsedMillis64 & operator += (uint64_t val)      { ms -= val ; return *this; }
-    elapsedMillis64 operator - (int val) const            { elapsedMillis64 r(*this); r.ms += val; return r; }
-    elapsedMillis64 operator - (unsigned int val) const   { elapsedMillis64 r(*this); r.ms += val; return r; }
-    elapsedMillis64 operator - (long val) const           { elapsedMillis64 r(*this); r.ms += val; return r; }
-    elapsedMillis64 operator - (unsigned long val) const  { elapsedMillis64 r(*this); r.ms += val; return r; }
-    elapsedMillis64 operator - (int64_t val) const        { elapsedMillis64 r(*this); r.ms += val; return r; }
-    elapsedMillis64 operator - (uint64_t val) const       { elapsedMillis64 r(*this); r.ms += val; return r; }
-    elapsedMillis64 operator + (int val) const            { elapsedMillis64 r(*this); r.ms -= val; return r; }
-    elapsedMillis64 operator + (unsigned int val) const   { elapsedMillis64 r(*this); r.ms -= val; return r; }
-    elapsedMillis64 operator + (long val) const           { elapsedMillis64 r(*this); r.ms -= val; return r; }
-    elapsedMillis64 operator + (unsigned long val) const  { elapsedMillis64 r(*this); r.ms -= val; return r; }
-    elapsedMillis64 operator + (int64_t val) const        { elapsedMillis64 r(*this); r.ms -= val; return r; }
-    elapsedMillis64 operator + (uint64_t val) const       { elapsedMillis64 r(*this); r.ms -= val; return r; }
-};
 
 //////////////////////////////////////////////
 
@@ -353,7 +422,7 @@ inline float gammaCorrect(float value) {
 void dimmerTask(void* params) {
 	TickType_t lastTicks = xTaskGetTickCount();
 	float currentIndicatorValue = -1;
-	elapsedMillis64 lastChange;
+	uint32_t loopCount = 0;
 
 	while (true) {
 		xTaskDelayUntil(&lastTicks, pdMS_TO_TICKS(ledUpdateRateInterval));
@@ -385,29 +454,113 @@ void dimmerTask(void* params) {
 			}
 		}
 
-		constexpr uint32_t indicatorOutTime = 5 * 60 * 1000;
+		bool updateChange = true;
 
-		if (firstValue == -1 && lastChange > indicatorOutTime) {
-			firstValue = -2;
+		if (firstValue == -1) {
+			uint64_t time = millis64() - lastIndicatorChange;
+			if (time > indicatorOffTime) {
+				if (loopCount<295) {
+					firstValue = -2;
+				}
+				else {
+					updateChange = false;
+				}
+			}
 		}
 
 		if (firstValue != currentIndicatorValue) {
 			if (firstValue == -1) {
-				setIndicator(savedIndicatorColor);
-				lastChange = 0;
+				setIndicator(savedIndicatorColor, false, updateChange);
 			}
 			else if (firstValue == -2) {
-				setIndicator(0);
+				powerOffIndicator();
 			}
 			else {
 				uint8_t value255 = firstValue * maxIndicatorValue / homeKitBrightnessMax;
 				setIndicator8(max((uint8_t)1, value255));
-				lastChange = 0;
 			}
 			currentIndicatorValue = firstValue;
 		}
+
+		loopCount = (loopCount + 1) % 300;
 	}
 }
+
+//////////////////////////////////////////////
+
+struct ButtonDevice;
+
+typedef struct {
+	ButtonDevice* buttonDevice;
+	uint8_t groupID;	
+} ButtonGroupItem;
+
+ButtonGroupItem buttonGroupList[deviceCount];
+uint16_t buttonGroupCount = 0;
+
+struct ButtonDevice {
+	SpanCharacteristic *_onOff = NULL;
+	SpanCharacteristic *_level = NULL;
+
+	SpanButton* _button = NULL;
+	bool _forceFull = false;
+	uint8_t _groupID = 0;
+	uint32_t _lastPressTime;
+
+	DimInfoRec* _dimInfo;
+
+	ButtonDevice(int16_t buttonPin, DimInfoRec* dimInfo) : _dimInfo(dimInfo) {
+		if (buttonPin != -1) {
+			if (buttonPin & SwitchToggleBit) {
+				SerPrintf("Add toggle switch on pin %d\n", buttonPin & SwitchPinMask);
+				_button = new SpanToggle(buttonPin & SwitchPinMask);
+			}
+			else {
+				SerPrintf("Add button on pin %d\n", buttonPin & SwitchPinMask);
+				_button = new SpanButton(buttonPin & SwitchPinMask);
+			}
+
+			_forceFull = (buttonPin & SwitchForceFullBit) != 0;
+
+			if (buttonPin & SwitchGroupMask) {
+				_groupID = SWITCH_GROUP_ID(buttonPin);
+				SerPrintf("Assign to group %d\n", _groupID);
+				buttonGroupList[buttonGroupCount].buttonDevice = this;
+				buttonGroupList[buttonGroupCount].groupID = _groupID;
+				buttonGroupCount++;
+			}
+		}
+	};
+
+	virtual void refreshOutput() {};
+
+	void setState(bool on) {
+		_onOff->setVal(on);
+		if (_level != NULL && on && _level->getVal() < (_forceFull ? 1 : 100)) {
+			_level->setVal(100);
+		}
+		refreshOutput();
+	}
+
+	void handleButton(int pressType) {
+		if (pressType == SpanButton::SINGLE || pressType == SpanToggle::CLOSED || pressType == SpanToggle::OPEN) {
+			uint32_t time = millis();
+			bool state = _onOff->getVal();
+			
+			if (_groupID != 0 && ((time-_lastPressTime) < SwitchDoublePressTime)) {
+				for (auto i=0; i<buttonGroupCount; i++) {
+					if (buttonGroupList[i].groupID == _groupID && buttonGroupList[i].buttonDevice != this) {
+						buttonGroupList[i].buttonDevice->setState(state);
+					}
+				}
+			}
+			else {
+				setState(!state);
+			}
+			_lastPressTime = time;
+		}
+	}
+};
 
 //////////////////////////////////////////////
 
@@ -415,23 +568,15 @@ float fadeStep(uint16_t duration, uint16_t defaultValue) {
 	return homeKitBrightnessMax * ledUpdateRateInterval / (duration==0 ? defaultValue : duration);
 }
 
-struct DimmableLED : Service::LightBulb {
-	SpanCharacteristic *_on;
-	SpanCharacteristic *_brightness;
-	
-	SpanButton* _button = NULL;
-	DimInfoRec* _dimInfo;
-
+struct DimmableLED : Service::LightBulb, ButtonDevice {
 	float _fadeUpStep;
 	float _fadeDownStep;
 	float _fadeFastStep;
 
-	DimmableLED(LEDDeviceRec* device, DimInfoRec* dimInfo) : Service::LightBulb() {
-		_on = new Characteristic::On();
-		_brightness = new Characteristic::Brightness(100);
-		_brightness->setRange(0, 100, 1);
-
-		_dimInfo = dimInfo;
+	DimmableLED(LEDDeviceRec* device, DimInfoRec* dimInfo) : Service::LightBulb(), ButtonDevice(device->buttonPin, dimInfo) {
+		_onOff = new Characteristic::On();
+		_level = new Characteristic::Brightness(100);
+		_level->setRange(0, 100, 1);
 
 		switch (device->type) {
 			case Device_RGB:
@@ -452,26 +597,18 @@ struct DimmableLED : Service::LightBulb {
 		_fadeUpStep = fadeStep(device->fadeUpDuration, defaultFadeUpTime);
 		_fadeDownStep = fadeStep(device->fadeDownDuration, defaultFadeDownTime);
 		_fadeFastStep = fadeStep(device->fadeFastDuration, defaultFadeFastTime);
-
-		if (device->buttonPin != -1) {
-			if (device->buttonPin & SwitchToggleBit) {
-				_button = new SpanToggle(device->buttonPin);
-			}
-			else {
-				_button = new SpanButton(device->buttonPin);
-			}
-		}
 	}
 
 	void refreshLevel(bool fast = false) {
 		float currentLevel = _dimInfo->currentLevel;
-		float newLevel = _on->getNewVal() * _brightness->getNewVal();
+		float newLevel = _onOff->getNewVal() * _level->getNewVal();
 
 		if (newLevel != currentLevel) {
 			float step;
 
 			if (fast) {
 				step = (newLevel >= currentLevel) ? _fadeFastStep : -_fadeFastStep;
+				step *= abs(newLevel-currentLevel) / homeKitBrightnessMax;
 			}
 			else {
 				step = (newLevel >= currentLevel) ? _fadeUpStep : -_fadeDownStep;
@@ -485,38 +622,30 @@ struct DimmableLED : Service::LightBulb {
 	}
 
 	boolean update() {
-		refreshLevel(_brightness->updated());
+		refreshLevel(_level->updated());
 		return(true);  
 	}
 
+	void refreshOutput() {
+		refreshLevel();
+	}
+
 	void button(int pin, int pressType) {
-		if (pressType == SpanButton::SINGLE) {
-			bool newOn = !_on->getVal();
-			_on->setVal(newOn);
-			if (newOn && _brightness->getVal() == 0) {
-				_brightness->setVal(100);
-			}
-			refreshLevel();
-		}
+		handleButton(pressType);
 	}
 };
 
 //////////////////////////////////////////////
-struct FanPWM : Service::Fan {
+struct FanPWM : Service::Fan, ButtonDevice {
 	SetValue* _output;
-	SpanCharacteristic *_active;
-	SpanCharacteristic *_speed;
 	Adafruit_NeoPixel *_buttonLED = NULL;
-	SpanButton* _button = NULL;
-	DimInfoRec* _dimInfo;
 
-	FanPWM(LEDDeviceRec* device, DimInfoRec* dimInfo) : Service::Fan() {
-		_active = new Characteristic::Active(false);
-		_speed = new Characteristic::RotationSpeed(0, true);
+	FanPWM(LEDDeviceRec* device, DimInfoRec* dimInfo) : Service::Fan(), ButtonDevice(device->buttonPin, dimInfo) {
+		_onOff = new Characteristic::Active(false);
+		_level = new Characteristic::RotationSpeed(0, true);
 
-		_speed->setRange(0, 100, 1);
+		_level->setRange(0, 100, 1);
 
-		_dimInfo = dimInfo;
 		_output = new LedPinWithSetValue(device->outputPin, 0, 25000);
 
 		if (device->clockPin != -1) {
@@ -525,20 +654,11 @@ struct FanPWM : Service::Fan {
 			_buttonLED->show();
 		}
 
-		if (device->buttonPin != -1) {
-			if (device->buttonPin & SwitchToggleBit) {
-				_button = new SpanToggle(device->buttonPin);
-			}
-			else {
-				_button = new SpanButton(device->buttonPin);
-			}
-		}
-
 		update();
 	}
 
 	boolean update() {
-		float newSpeed = _active->getNewVal() * _speed->getNewVal();
+		float newSpeed = _onOff->getNewVal() * _level->getNewVal();
 		constexpr uint8_t ledBright = 30;
 		uint32_t color = MAKE_RGB(0, ledBright/3, 0);
 
@@ -566,55 +686,39 @@ struct FanPWM : Service::Fan {
 		return true;
 	}
 
+	void refreshOutput() {
+		update();
+	}
+
 	void button(int pin, int pressType) {
-		if (pressType == SpanButton::SINGLE) {
-			bool newActive = !_active->getVal();
-			_active->setVal(newActive);
-			if (newActive && _speed->getVal() == 0) {
-				_speed->setVal(100);
-			}
-			update();
-		}
+		handleButton(pressType);
 	}
 };
 
 //////////////////////////////////////////////
-struct DigitalPin : Service::Switch {
+struct DigitalPin : Service::Switch, ButtonDevice {
 	int _pin;
-	SpanButton* _button = NULL;
-	SpanCharacteristic *_on;
-	DimInfoRec* _dimInfo;
 
-	DigitalPin(LEDDeviceRec* device, DimInfoRec* dimInfo) : Service::Switch(){
-		_on = new Characteristic::On();
-		_pin = device->outputPin;
-		_dimInfo = dimInfo;
+	DigitalPin(LEDDeviceRec* device, DimInfoRec* dimInfo) : Service::Switch(), ButtonDevice(device->buttonPin, dimInfo), _pin(device->outputPin) {
+		_onOff = new Characteristic::On();
 		pinMode(_pin,OUTPUT);
 		digitalWrite(_pin, LOW);
-
-		if (device->buttonPin != -1) {
-			if (device->buttonPin & SwitchToggleBit) {
-				_button = new SpanToggle(device->buttonPin);
-			}
-			else {
-				_button = new SpanButton(device->buttonPin);
-			}
-		}
 	}
 
 	boolean update() {            
-		bool value = _on->getNewVal();
+		bool value = _onOff->getNewVal();
 		digitalWrite(_pin, value);
 		_dimInfo->currentLevel = value * 100;
 		_dimInfo->currentCorrectedLevel = _dimInfo->currentLevel;
 		return(true);
 	}
 
+	void refreshOutput() {
+		update();
+	}
+
 	void button(int pin, int pressType) {
-		if (pressType == SpanButton::SINGLE) {
-			_on->setVal(!_on->getVal());
-			update();
-		}
+		handleButton(pressType);
 	}
 };
 	  
@@ -643,7 +747,7 @@ void createDevices() {
 		LEDDeviceRec* device = &deviceList[i];
 		DimInfoRec* dimInfo = &dimmerData[i];
 
-		SerPrintf("Creating \'%s\' on pin %d\n", device->name, device->outputPin);
+		SerPrintf("*** Creating \'%s\' on pin %d\n", device->name, device->outputPin);
 
 		SPAN_ACCESSORY(device->name);
 			switch (device->type) {
@@ -673,6 +777,8 @@ void setInitialPins() {
 				pinMode(device->outputPin, OUTPUT);
 				digitalWrite(device->outputPin, LOW);
 				break;
+			default:
+				break;
 		}
 	}
 }
@@ -680,15 +786,123 @@ void setInitialPins() {
 //////////////////////////////////////////////
 
 void telnetConnected(String ip) {
-  SerPrintf("%s connected.\n", ip);
+  SerPrintf("%s connected.\n", ip.c_str());
   setIndicator(telnetColor, true);
   homeSpan.outputStream = &telnet;
 }
 
 void telnetDisconnected(String ip) {
-  SerPrintf("%s disconnected.\n", ip);
+  SerPrintf("%s disconnected.\n", ip.c_str());
   setIndicator(readyColor, true);
   homeSpan.outputStream = &Serial;
+}
+
+//////////////////////////////////////////////
+
+void cmdShowPartitions(const char* buf) {
+	constexpr const char* types[] = { "app", "data", "????" };
+
+	homeSpan.printf("\n*** ESP32 Partition table: ***\n\n");
+
+	homeSpan.printf("┌──────┬─────────┬──────────┬──────────┬──────────────────┐\n");
+	homeSpan.printf("│ Type │ Subtype │  Offset  │   Size   │       Label      │\n");
+	homeSpan.printf("├──────┼─────────┼──────────┼──────────┼──────────────────┤\n");
+
+	esp_partition_iterator_t iterator = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
+	while (iterator) {
+		const esp_partition_t* p = esp_partition_get(iterator);
+		char subTypeBuff[10];
+		const char* subType = "";
+
+		if (p->type == 0) {
+			if (p->subtype==0) {
+				subType = "factory";
+			}
+			else if (p->subtype>=0x10 && p->subtype<=0x1F) {
+				snprintf(subTypeBuff, sizeof(subTypeBuff), " ota_%d", p->subtype-0x10);
+				subType = subTypeBuff;
+			}
+			else if (p->subtype==0x20) {
+				subType = " test";
+			}
+		}
+		else if (p->type == 1) {
+			if (p->subtype==0) { subType = "  ota"; }
+			else if (p->subtype==1) { subType = "  phy"; }
+			else if (p->subtype==2) { subType = "  nvs"; }
+			else if (p->subtype==3) { subType = "nvskeys"; }
+		}
+
+		homeSpan.printf("│ %-4s │ %-7s │ 0x%06X │ 0x%06X │ %-16s │\n", types[min(2, (int)p->type)], subType, p->address, p->size, p->label);
+		
+		iterator = esp_partition_next(iterator);
+	}
+
+	homeSpan.printf("└──────┴─────────┴──────────┴──────────┴──────────────────┘\n\n");
+}
+
+void cmdUpdateAccessories(const char *buf){
+
+	if(homeSpan.updateDatabase()) {
+    	homeSpan.printf("Accessories Database updated.  New configuration number broadcast...\n");
+	}
+	else {
+    	homeSpan.printf("Nothing to update - no changes were made!\n");
+	}
+}
+
+float getCPUTemp() {
+	float temp;
+	temp_sensor_read_celsius(&temp);
+	return (temp * 1.8) + 32.0;
+}
+
+void cmdShowCPUStats(const char *buff = NULL) {
+	homeSpan.printf("\n*** CPU Stats ***\n\n");
+	homeSpan.printf("CPU frequency: %dMHz\n", getCpuFrequencyMhz());
+	homeSpan.printf("Xtal frequency: %dMHz\n", getXtalFrequencyMhz());
+	homeSpan.printf("Bus frequency: %dMHz\n", getApbFrequency()/1000000);
+	homeSpan.printf("CPU Tempterature: %0.1fºF\n", getCPUTemp());
+
+	uint32_t time = micros();
+	float f = 0;
+	for (auto i=0; i<1000; i++) {
+		f += gammaCorrect(50.0 + (float)i/100.0);
+	}
+	float duration = (micros() - time) / 1000.0 + f * 1e-40;	// multiply f to basically zero, avoids unused variable warning
+	homeSpan.printf("Timing test: pow(x) = %0.2fuS\n", duration);
+
+	homeSpan.printf("Total heap: %d\n", ESP.getHeapSize());
+	homeSpan.printf("Free heap: %d\n", ESP.getFreeHeap());
+	homeSpan.printf("Total PSRAM: %d\n", ESP.getPsramSize());
+	homeSpan.printf("Free PSRAM: %d\n", ESP.getFreePsram());
+
+	homeSpan.printf("\n*** CPU Stats ***\n\n");
+}
+
+void cmdSetFrequency(const char *buff) {
+	buff += 1;
+	
+	int16_t frequency = atoi(buff);
+
+	switch (frequency) {
+		case 240:
+		case 160:
+		case 80:
+			setCpuFrequencyMhz(frequency);
+			homeSpan.printf("CPU Frequency set to: %dMHz\n", getCpuFrequencyMhz());
+			break;
+		default:
+			homeSpan.printf("Invalid CPU frequency: %dMHz\n", frequency);
+			break;
+	}
+}
+
+void addCommands() {
+	new SpanUserCommand('s',"show CPU stats", cmdShowCPUStats);
+	new SpanUserCommand('f',"<freq> - set CPU frequency", cmdSetFrequency);
+	new SpanUserCommand('u',"update accessory database", cmdUpdateAccessories);
+	new SpanUserCommand('p',"show partition table", cmdShowPartitions);
 }
 
 //////////////////////////////////////////////
@@ -707,6 +921,8 @@ void statusChanged(HS_STATUS status) {
 		if (!(currentIndicatorColor & whiteColorFlag)) {
 			setIndicator(connectingColor, true);
 		}
+		currentIndicatorColor = connectingColor;
+		telnet.stop();
 		SerPrintf("Lost WIFI Connection...\n");
 	}
 }
@@ -715,13 +931,13 @@ void wifiReady() {
 	if (!(currentIndicatorColor & whiteColorFlag)) {
 		setIndicator(readyColor, true);
 	}
-	SerPrintf("WIFI Ready.\n");
+	SerPrintf("WIFI: Ready.\n");
 
-	SerPrintf("Telnet.begin: ");
-	telnet.onConnect(telnetConnected);
-	telnet.onDisconnect(telnetDisconnected);
-	telnet.onReconnect(telnetConnected);
+	SerPrintf("Telnet: begin - ");
 	if(telnet.begin()) {
+		telnet.onConnect(telnetConnected);
+		telnet.onDisconnect(telnetDisconnected);
+		telnet.onReconnect(telnetConnected);
 		SerPrintf("Successful\n");
 	} else {
 		SerPrintf("Failed\n");
@@ -733,15 +949,16 @@ TaskHandle_t t;
 void setup() {
 	setInitialPins();
 
-	pinMode(indicatorPowerPin, OUTPUT);
-	digitalWrite(indicatorPowerPin, HIGH);
-
 	indicator.begin();
 	flashIndicator(flashColor, 20, 200);
 	setIndicator(startColor, true);
 
 	Serial.begin(115200);
 	SerPrintf("Home-LED Startup\n");
+
+	#ifdef CPU_FREQUENCY
+	setCpuFrequencyMhz(CPU_FREQUENCY);
+	#endif
 
 	SerPrintf("Init HomeSpan\n");
 	homeSpan.setSketchVersion(versionString);
@@ -752,6 +969,14 @@ void setup() {
 
 	SerPrintf("Create devices\n");
 	createDevices();
+	addCommands();
+
+	SerPrintf("Init Temperature Sensor\n");
+    temp_sensor_config_t temp_sensor = TSENS_CONFIG_DEFAULT();
+    temp_sensor_get_config(&temp_sensor);
+    temp_sensor.dac_offset = TSENS_DAC_DEFAULT; // DEFAULT: range: -10ºC ~ 80ºC, error < 1ºC.
+    temp_sensor_set_config(temp_sensor);
+    temp_sensor_start();
 
 	SerPrintf("Create dimmer task\n");
 	xTaskCreate(dimmerTask, "LED_Dimmer", dimmerTaskStackSize, NULL, 0, &t);
@@ -765,5 +990,6 @@ void setup() {
 
 void loop() {
 	telnet.loop();
+	telnet.flushAfterDelay();
 	homeSpan.poll();
 }
