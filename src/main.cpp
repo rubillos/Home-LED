@@ -1,31 +1,105 @@
 #include "Arduino.h"
 
 #include "HomeSpan.h" 
-#include "Wire.h"
-#include "Adafruit_HUSB238.h"
+#include <Preferences.h>
 
-Adafruit_HUSB238 husb238;
+//--------------------------------------------------------------------
 
-//////////////////////////////////////////////
+#if defined(OTADEBUG) || defined(DEBUG)
+#define SerPrintf(...) Serial.printf(__VA_ARGS__)
+#define SerBegin(...) Serial.begin(__VA_ARGS__)
+#else
+#define SerPrintf(...)
+#define SerBegin(...)
+#endif
+
+//--------------------------------------------------------------------
+
+constexpr uint8_t statusStripPin = 33;
+constexpr uint8_t statusStripLength = 4;
+
+constexpr uint8_t indicatorDataPin = RGB_DATA;	// 40
+constexpr uint8_t indicatorPowerPin = RGB_PWR;	// 39
+
+constexpr uint8_t ambientLightPin = 4;
+
+//--------------------------------------------------------------------
+// Pins
+
+constexpr uint8_t servoPinWasher = MOSI; // 35
+constexpr uint8_t servoPinDryer = SCK;	//36
+constexpr uint8_t servoPinInverter = 5;
+constexpr uint8_t servoPinConverter = 6;
+
+constexpr uint8_t sensePinWasher = 17;
+constexpr uint8_t sensePinDryer = 18;
+constexpr uint8_t sensePinInverter = 14;
+constexpr uint8_t sensePinConverter = 12;
+
+constexpr uint8_t ledPinWasher = TX;	// 43
+constexpr uint8_t ledPinDryer = SDA;	// 8
+constexpr uint8_t ledPinInverter = MISO;	// 37
+constexpr uint8_t ledPinConverter = SCL;	// 9
+
+constexpr uint8_t buttonPinWasher = 7;
+constexpr uint8_t buttonPinDryer = 3;
+constexpr uint8_t buttonPinInverter = 1;
+constexpr uint8_t buttonPinConverter = 38;
+
+constexpr uint8_t statusIndexWasher = 0;
+constexpr uint8_t statusIndexDryer = 1;
+constexpr uint8_t statusIndexInverter = 2;
+constexpr uint8_t statusIndexConverter = 3;
+
+//--------------------------------------------------------------------
+constexpr uint16_t ADC_Max = 4095;     // This is the default ADC max value on the ESP32 (12 bit ADC width);
+
+constexpr uint16_t adcOnLevel = 2400; // ADC value above which the breaker is considered ON
+constexpr uint16_t adcOffLevel = 2200; // ADC value above which the breaker is considered OFF
+
+constexpr uint16_t servoMinUSec = 500;
+constexpr uint16_t servoMaxUSec = 2500;
+
+constexpr double servoDisable = NAN;
+constexpr double servoMinAngle = -90;
+constexpr double servoMaxAngle = 90;
+
+constexpr int servoCenterAngle = 0;
+
+constexpr uint32_t servoPushTimeMS = 250;
+constexpr uint32_t servoTotalTimeMS = servoPushTimeMS * 2;
+
+constexpr uint32_t senseChangeTimeMS = servoPushTimeMS + 50;
+constexpr uint32_t breakerDelayTimeMS = servoPushTimeMS + 100;
+constexpr uint32_t buddyDelayTimeMS = 0;
+
+constexpr uint8_t ledDarkBrightness = 10;
+
+constexpr uint8_t statusStripDarkBrightness = 1;
+constexpr uint8_t statusStripBrightBrightness = 20;
+
+constexpr uint16_t darkLowThreshold = 700;
+constexpr uint16_t darkHighThreshold = 1000;
+
+constexpr uint32_t lightCheckTimeMS = 1000;
+
+//--------------------------------------------------------------------
+
+Pixel indicator(indicatorDataPin, "GRB");
+
+//--------------------------------------------------------------------
+
+Preferences preferences;
+
+const char* movePrefName = "moveAngle";
+constexpr int16_t initialServoMoveAngle = 20;
+int16_t servoMoveAngle = initialServoMoveAngle;
+
+//--------------------------------------------------------------------
 
 constexpr const char* versionString = "v0.5";
 
-//////////////////////////////////////////////
-
-constexpr uint32_t ledUpdateRate = 100;
-constexpr uint32_t ledUpdateRateInterval = 1000 / ledUpdateRate;
-
-constexpr uint32_t defaultFadeUpTime = 500;
-constexpr uint32_t defaultFadeDownTime = 2000;
-constexpr uint32_t defaultFadeFastTime = 300;
-
-constexpr uint32_t indicatorOffTime = 30 * 1000;
-
-constexpr float homeKitBrightnessMax = 100.0;
-
-constexpr uint32_t dimmerTaskStackSize = 3000;
-
-//////////////////////////////////////////////
+//--------------------------------------------------------------------
 
 constexpr float ledGamma = 2.8;
 constexpr uint8_t maxIndicatorValue = 20;
@@ -38,282 +112,43 @@ constexpr uint32_t startColor = MAKE_RGB(ledStatusLevel, 0, 0);
 constexpr uint32_t connectingColor = MAKE_RGB(0, 0, ledStatusLevel);
 constexpr uint32_t readyColor = MAKE_RGB(0, ledStatusLevel, 0);
 
-uint32_t currentIndicatorColor = 0xFFFFFFFF;
+constexpr uint8_t v255 = 0xFF;
+constexpr uint32_t unknownColor = 0xFFFFFFFE;
+
+uint32_t currentIndicatorColor = unknownColor;
 uint32_t savedIndicatorColor = 0;
 
 constexpr uint32_t whiteColorFlag = 1 << 24;
 
-//////////////////////////////////////////////
+//--------------------------------------------------------------------
 
-typedef enum {
-	output12V = 0,
-	output9V = 1,
-	outputOther = 3
-} OutputVoltage_t;
+constexpr const char* displayName = "PwrCenter-Controller";
+constexpr const char* modelName = "PwrCenter-Controller-ESP32-S3";
 
-OutputVoltage_t availableOutputVoltage = output12V;
-
-constexpr uint32_t color9V = MAKE_RGB(ledStatusLevel, ledStatusLevel, 0);
-constexpr uint32_t colorLowV = MAKE_RGB(ledStatusLevel, 0, ledStatusLevel/2);
-
-//////////////////////////////////////////////
-
-#if defined(OTADEBUG) || defined(DEBUG)
-#define SerPrintf(...) Serial.printf(__VA_ARGS__)
-#define SerBegin(...) Serial.begin(__VA_ARGS__)
-#else
-#define SerPrintf(...)
-#define SerBegin(...)
-#endif
-
-//////////////////////////////////////////////
-
-typedef enum {
-	Device_RGB = 0,
-	Device_RGBW,
-	Device_W,
-
-	Device_DotStar_RGB,
-	Device_DotStar_W,
-
-	Device_LED,
-
-	Device_Switch,
-	Device_Fan,
-
-	Device_Button,
-} StripType;
-
-constexpr uint16_t SwitchToggleBit = 0x4000;
-constexpr uint16_t SwitchForceFullBit = 0x2000;
-constexpr uint16_t SwitchGroupMask = 0x1C00;
-constexpr uint16_t SwitchGroupShift = 10;
-constexpr uint16_t SwitchPinMask = 0x03FF;
-
-constexpr uint32_t SwitchDoublePressTime = 500;
-
-#define SWITCH_GROUP_BITS(groupID) (groupID << SwitchGroupShift)
-#define SWITCH_GROUP_ID(buttonPin) ((buttonPin & SwitchGroupMask) >> SwitchGroupShift)
-
-//////////////////////////////////////////////
-
-class SetValue {
-	public:
-		SetValue(StripType type=Device_RGB) : _type(type) {};
-		virtual void setValue(float value) {};
-		uint32_t brightnessToColor(float value) {
-			switch (_type) {
-				case Device_RGB:
-				case Device_DotStar_RGB: {
-					uint8_t w = value / homeKitBrightnessMax * 255;
-					return w<<16 | w<<8 | w;
-				}
-				case Device_RGBW: {
-					uint8_t w = value / homeKitBrightnessMax * 255;
-					return w<<24;;
-				}
-				case Device_W:
-				case Device_DotStar_W: {
-					uint16_t w = value / homeKitBrightnessMax * 255 * 3;
-					uint8_t w1 = max(0, w-512);
-					uint8_t w2 = min(255, max(0, w-256));
-					uint8_t w3 = min(255, max(0, w-0));
-					return w1<<16 | w2<<8 | w3;
-				}
-				default:
-					return 0;
-					break;
-			}
-		};
-
-	private:
-		StripType _type;
-};
-
-class LedPinWithSetValue : public LedPin , public SetValue {
-	public:
-		LedPinWithSetValue(uint8_t pin, float level=0, uint16_t freq=DEFAULT_PWM_FREQ, boolean invert=false) : LedPin(pin, level, freq, invert) {};
-		void setValue(float value) { set(value); };
-};
-
-class PixelWithSetValue : public Pixel , public SetValue {
-	public:
-		PixelWithSetValue(int pin, int pixelCount, StripType type=Device_RGB) : Pixel(pin, ((type==Device_RGBW) ? "GRBW" : "GRB")), SetValue(type) { };
-		void setValue(float value) {
-			uint32_t color = brightnessToColor(value);
-			set(Pixel::Color().RGB((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF, color>>24));
-		};
-};
-
-class DotWithSetValue : public Dot , public SetValue {
-	public:
-		DotWithSetValue(uint8_t dataPin, uint8_t clockPin, int pixelCount, StripType type=Device_RGB) : Dot(dataPin, clockPin), SetValue(type) { };
-		void setValue(float value) {
-			uint32_t color = brightnessToColor(value);
-			set(Dot::Color().RGB((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF, color>>24));
-		};
-};
-
-//////////////////////////////////////////////
-
-typedef struct LEDDeviceRec {
-	StripType type;
-	const char* name;
-	uint8_t outputPin;
-	int16_t buttonPin = -1;
-	int16_t clockPin = -1;
-	uint8_t count = 0;
-	uint16_t fadeUpDuration = 0;
-	uint16_t fadeDownDuration = 0;
-	uint16_t fadeFastDuration = 0;
-
-	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, int16_t buttonPin, uint16_t fadeUpDuration, uint16_t fadeDownDuration, uint16_t fadeFastDuration) : 
-				type(type), name(name), outputPin(outputPin), buttonPin(buttonPin), 
-				fadeUpDuration(fadeUpDuration), fadeDownDuration(fadeDownDuration), fadeFastDuration(fadeFastDuration) { }
-	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, uint8_t count, int16_t buttonPin, uint16_t fadeUpDuration, uint16_t fadeDownDuration, uint16_t fadeFastDuration) : 
-				type(type), name(name), outputPin(outputPin), buttonPin(buttonPin), count(count), 
-				fadeUpDuration(fadeUpDuration), fadeDownDuration(fadeDownDuration), fadeFastDuration(fadeFastDuration) { }
-	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, uint8_t count, int16_t clockPin, int16_t buttonPin, uint16_t fadeUpDuration, uint16_t fadeDownDuration, uint16_t fadeFastDuration) : 
-				type(type), name(name), outputPin(outputPin), buttonPin(buttonPin), clockPin(clockPin), count(count), 
-				fadeUpDuration(fadeUpDuration), fadeDownDuration(fadeDownDuration), fadeFastDuration(fadeFastDuration) { }
-	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, int16_t buttonPin) : 
-				type(type), name(name), outputPin(outputPin), buttonPin(buttonPin) { }
-	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, uint8_t count, int16_t buttonPin) : 
-				type(type), name(name), outputPin(outputPin), buttonPin(buttonPin), count(count) { }
-	LEDDeviceRec(StripType type, const char* name, const uint8_t outputPin, uint8_t count, int16_t clockPin, int16_t buttonPin) : 
-				type(type), name(name), outputPin(outputPin), buttonPin(buttonPin), clockPin(clockPin), count(count) { }
-	LEDDeviceRec(StripType type, const char* name, const int16_t buttonPin) :
-				type(type), name(name), buttonPin(buttonPin) { }
-} LEDDeviceRec;
-
-// Device_RGB/Device_RGBW/Device_W,Device_LED, "name", outputPin, buttonPin
-// Device_RGB/Device_RGBW/Device_W,Device_LED, "name", outputPin, count, buttonPin
-// Device_RGB/Device_RGBW/Device_W,Device_LED, "name", outputPin, buttonPin, fadeUpDuration, fadeDownDuration, fadeFastDuration
-// Device_RGB/Device_RGBW/Device_W,Device_LED, "name", outputPin, count, buttonPin, fadeUpDuration, fadeDownDuration, fadeFastDuration
-//
-// Device_Dotstar_RGB/Device_DotStar_W, "name", "dataPin", count, clockPin, buttonPin
-// Device_Dotstar_RGB/Device_DotStar_W, "name", outputPin, count, clockPin, buttonPin, fadeUpDuration, fadeDownDuration, fadeFastDuration
-//
-// Device_Switch, "name", outputPin, buttonPin
-// Device_LED, "name", outputPin, buttonPin
-// Device_Fan, "name", outputPin, unused, neoPixelPin, buttonPin
-//
-// Device_Button, "name", buttonPin
-
-//////////////////////////////////////////////
-
-// #define PENGUIN_LIGHT
-#define PNGXPRS_LOWER_ACCENT
-// #define PNGXPRS_UPPER_LED
-// #define PNGXPRS_DINING
-// #define FAN_LR
-// #define FAN_BB
-
-#if defined(TINYS3)
-
-#if defined(PNGXPRS_UPPER_LED)
-
-// Penguin Express Top Lighting Strip
-constexpr const char* displayName = "Upper-LED-Controller";
-constexpr const char* modelName = "Upper-LED-Controller-ESP32";
-LEDDeviceRec deviceList[] = {
-	{ Device_LED, "LED", 8, 36 },
-	{ Device_Button, "Button", 37 },
-};
-#define CPU_FREQUENCY 80
-
-#elif defined(FAN_LR)
-
-constexpr const char* displayName = "Fan-Controller";
-constexpr const char* modelName = "Fan-Controller-LR";
-LEDDeviceRec deviceList[] = {
-	{ Device_Fan, "Fan", 2, 0, 3, 4 | SwitchForceFullBit },
-};
-
-#elif defined(FAN_BB)
-constexpr const char* displayName = "Fan-Controller";
-constexpr const char* modelName = "Fan-Controller-BB";
-LEDDeviceRec deviceList[] = {
-	{ Device_Fan, "Fan", 2, 0, 3, 4 | SwitchForceFullBit },
-};
-
-#else
-#error No Device Definitions Found - Check build defines
-#endif
-
-#elif defined(QTPYS3)
-// Penguin Light
-#if defined(PENGUIN_LIGHT)
-
-constexpr const char* displayName = "Penguin-Controller";
-constexpr const char* modelName = "Penguin-Controller-ESP32";
-LEDDeviceRec deviceList[] = {
-	{ Device_LED, "Penguin", SCK, 0 },
-};
-
-#elif defined(PNGXPRS_LOWER_ACCENT)
-
-constexpr const char* displayName = "Accent-Controller";
-constexpr const char* modelName = "Accent-Controller-ESP32";
-LEDDeviceRec deviceList[] = {
-	{ Device_LED, "Lower Accent", MOSI, 0 },
-};
-#define CPU_FREQUENCY 80
-
-#elif defined(PNGXPRS_DINING)
-
-constexpr const char* displayName = "Dining-Controller";
-constexpr const char* modelName = "Dining-Controller-ESP32";
-LEDDeviceRec deviceList[] = {
-	{ Device_LED, "Left", MOSI, SCK | SwitchToggleBit | SwitchForceFullBit | SWITCH_GROUP_BITS(1), 100, 1000, defaultFadeFastTime },
-	{ Device_LED, "Right", MISO, RX | SwitchToggleBit | SwitchForceFullBit | SWITCH_GROUP_BITS(1), 100, 1000, defaultFadeFastTime },
-};
-#define CPU_FREQUENCY 80
-
-#else
-#error No Device Definitions Found - Check build defines
-#endif
-
-#endif
-
-constexpr const char* otaPassword = "seattle";
-
-constexpr auto deviceCount = sizeof(deviceList) / sizeof(LEDDeviceRec);
-
-//////////////////////////////////////////////
-
-#ifdef TINYS3
-constexpr uint8_t indicatorDataPin = 18;
-constexpr uint8_t indicatorPowerPin = 17;
-#elif QTPYS3
-constexpr uint8_t indicatorDataPin = PIN_NEOPIXEL;
-constexpr uint8_t indicatorPowerPin = NEOPIXEL_POWER;
-#endif
+//--------------------------------------------------------------------
 
 uint64_t millis64() {
-  volatile static uint32_t low32 = 0, high32 = 0;
-  uint32_t new_low32 = millis();
+	volatile static uint32_t low32 = 0, high32 = 0;
+	uint32_t new_low32 = millis();
 
-  if (new_low32 < low32)
-	high32++;
+	if (new_low32 < low32)
+		high32++;
 
-  low32 = new_low32;
+	low32 = new_low32;
 
-  return (uint64_t) high32 << 32 | low32;
+	return (uint64_t) high32 << 32 | low32;
 }
 
 volatile uint64_t lastIndicatorChange;
-bool indicatorPowered = false;
 
-uint8_t pixelBrightness = 255;
+uint8_t pixelBrightness = 32;
 
-inline uint8_t mul8x8(uint8_t a, uint8_t b) { return (a * b) / 256; }
+inline uint8_t mul8x8(uint8_t a, uint8_t b) { return (a * b) / 255; }
 inline uint8_t pixBright(uint8_t value) { return mul8x8(value, pixelBrightness); }
 
 void setupIndicator() {
 	pinMode(indicatorPowerPin, OUTPUT);
 	digitalWrite(indicatorPowerPin, HIGH);
-	indicatorPowered = true;
 }
 
 void setIndicatorBrightness(uint8_t brightness) {
@@ -321,24 +156,17 @@ void setIndicatorBrightness(uint8_t brightness) {
 }
 
 void indicatorSetColor(uint32_t color) {
-	rgbLedWrite(indicatorDataPin, pixBright(color>>16), pixBright((color>>8)&0xFF), pixBright(color&0xFF));
+	indicator.set(Pixel::RGB(pixBright(color>>16), pixBright((color>>8)&v255), pixBright(color&v255)), 1);
 }
 
 void setIndicator(uint32_t color, bool saveColor = false, bool updateChanged = true) {
-	if (!indicatorPowered) {
-		pinMode(indicatorPowerPin, OUTPUT);
-		digitalWrite(indicatorPowerPin, HIGH);
-		indicatorPowered = true;
-		currentIndicatorColor = 0xFFFFFFFE;
-	}
-
 	if (color != currentIndicatorColor) {
 		currentIndicatorColor = color;
 		if (saveColor) {
 			savedIndicatorColor = color;
 		}
 		if (color & whiteColorFlag) {
-			color &= 0xFF;
+			color &= v255;
 			indicatorSetColor(color | (color << 16) | (color << 8));
 		}
 		else {
@@ -355,572 +183,654 @@ void setIndicator8(uint8_t color8) {
 	setIndicator(whiteColorFlag | color8);
 }
 
-void powerOffIndicator() {
-	if (indicatorPowered) {
-		digitalWrite(indicatorPowerPin, LOW);
-		indicatorPowered = false;
-	}
-}
+//--------------------------------------------------------------------
+typedef enum {
+	breakerStateOff = 0,
+	breakerStateOn = 1,
+	breakerStateTripped = -1,
+	breakerStateUnknown = 2
+} BreakerState_t;
 
-//////////////////////////////////////////////
+struct StatusStrip {
+	Pixel *_strip;
+	uint16_t _length;
+	uint8_t _brightness = 255;
+	BreakerState_t* _status;
+	Pixel::Color* _colors;
 
-typedef struct {
-	SetValue* led = NULL;
-
-	volatile float targetLevel = 0;
-	volatile float currentLevel = 0;
-	volatile float currentCorrectedLevel = 0;
-	volatile float levelStep = 0;
-
-	volatile float newTargetLevel = 0;
-	volatile float newLevelStep = 0;
-} DimInfoRec;
-
-DimInfoRec dimmerData[deviceCount];
-
-//////////////////////////////////////////////
-
-inline float gammaCorrect(float value) {
-	return pow(value / homeKitBrightnessMax, ledGamma) * homeKitBrightnessMax;
-}
-
-void dimmerTask(void* params) {
-	TickType_t lastTicks = xTaskGetTickCount();
-	float currentIndicatorValue = -1;
-	uint32_t loopCount = 0;
-
-	while (true) {
-		xTaskDelayUntil(&lastTicks, pdMS_TO_TICKS(ledUpdateRateInterval));
-
-		float firstValue = -1;
-
-		for (auto i=0; i<deviceCount; i++) {
-			DimInfoRec* dimInfo = &dimmerData[i];
-
-			if (dimInfo->newLevelStep != 0) {
-				dimInfo->targetLevel = dimInfo->newTargetLevel;
-				dimInfo->levelStep = dimInfo->newLevelStep;
-				dimInfo->newLevelStep = 0;
-			}
-			if (dimInfo->levelStep) {
-				dimInfo->currentLevel += dimInfo->levelStep;
-
-				if ((dimInfo->levelStep > 0 && dimInfo->currentLevel >= dimInfo->targetLevel) || (dimInfo->levelStep < 0 && dimInfo->currentLevel <= dimInfo->targetLevel)) {
-					dimInfo->currentLevel = dimInfo->targetLevel;
-					dimInfo->levelStep = 0;
-				}
-				dimInfo->currentCorrectedLevel = gammaCorrect(dimInfo->currentLevel);
-				if (dimInfo->led) {
-					dimInfo->led->setValue(dimInfo->currentCorrectedLevel);
-				}
-			}
-			if (firstValue==-1 && dimInfo->currentLevel>0) {
-				firstValue = dimInfo->currentCorrectedLevel;
+	void setBrightness(uint8_t brightness, bool show = true) {
+		if (brightness != _brightness) {
+			_brightness = brightness;
+			if (show) {
+				showPixels();
 			}
 		}
-
-		bool updateChange = true;
-
-		if (firstValue == -1) {
-			uint64_t time = millis64() - lastIndicatorChange;
-			if (time > indicatorOffTime) {
-				if (loopCount<295) {
-					firstValue = -2;
-				}
-				else {
-					updateChange = false;
-				}
-			}
-		}
-
-		if ((availableOutputVoltage != output12V) && (loopCount > 100) && (loopCount < 150)) {
-			uint32_t color = 0;
-
-			if (loopCount > 110 && loopCount < 140) {
-				color = availableOutputVoltage == output9V ? color9V : colorLowV;
-			}
-
-			setIndicator(color, false, false);
-			currentIndicatorValue = -3;
-		}
-		else if (firstValue != currentIndicatorValue) {
-			if (firstValue == -1) {
-				setIndicator(savedIndicatorColor, false, updateChange && !(currentIndicatorValue == -3));
-			}
-			else if (firstValue == -2) {
-				powerOffIndicator();
-			}
-			else {
-				uint8_t value255 = firstValue * maxIndicatorValue / homeKitBrightnessMax;
-				setIndicator8(max((uint8_t)1, value255));
-			}
-			currentIndicatorValue = firstValue;
-		}
-
-		loopCount = (loopCount + 1) % 300;
-	}
-}
-
-//////////////////////////////////////////////
-
-struct ButtonDevice;
-
-typedef struct {
-	ButtonDevice* buttonDevice;
-	uint8_t groupID;	
-} ButtonGroupItem;
-
-ButtonGroupItem buttonGroupList[deviceCount];
-uint16_t buttonGroupCount = 0;
-
-struct ButtonDevice {
-	SpanCharacteristic *_onOff = NULL;
-	SpanCharacteristic *_level = NULL;
-
-	SpanButton* _button = NULL;
-	bool _forceFull = false;
-	uint8_t _groupID = 0;
-	uint32_t _lastPressTime;
-
-	DimInfoRec* _dimInfo;
-
-	ButtonDevice(int16_t buttonPin, DimInfoRec* dimInfo) : _dimInfo(dimInfo) {
-		if (buttonPin != -1) {
-			if (buttonPin & SwitchToggleBit) {
-				SerPrintf("Add toggle switch on pin %d\n", buttonPin & SwitchPinMask);
-				_button = new SpanToggle(buttonPin & SwitchPinMask);
-			}
-			else {
-				SerPrintf("Add button on pin %d\n", buttonPin & SwitchPinMask);
-				_button = new SpanButton(buttonPin & SwitchPinMask);
-			}
-
-			_forceFull = (buttonPin & SwitchForceFullBit) != 0;
-
-			if (buttonPin & SwitchGroupMask) {
-				_groupID = SWITCH_GROUP_ID(buttonPin);
-				SerPrintf("Assign to group %d\n", _groupID);
-				buttonGroupList[buttonGroupCount].buttonDevice = this;
-				buttonGroupList[buttonGroupCount].groupID = _groupID;
-				buttonGroupCount++;
-			}
-		}
-	};
-
-	virtual void refreshOutput() {};
-
-	void setState(bool on) {
-		_onOff->setVal(on);
-		if (_level != NULL && on && _level->getVal() < (_forceFull ? 1 : 100)) {
-			_level->setVal(100);
-		}
-		refreshOutput();
 	}
 
-	void handleButton(int pressType) {
-		if (pressType == SpanButton::SINGLE || pressType == SpanToggle::CLOSED || pressType == SpanToggle::OPEN) {
-			uint32_t time = millis();
-			bool state = _onOff->getVal();
-			
-			if (_groupID != 0 && ((time-_lastPressTime) < SwitchDoublePressTime)) {
-				for (auto i=0; i<buttonGroupCount; i++) {
-					if (buttonGroupList[i].groupID == _groupID && buttonGroupList[i].buttonDevice != this) {
-						buttonGroupList[i].buttonDevice->setState(state);
-					}
-				}
-			}
-			else {
-				setState(!state);
-			}
-			_lastPressTime = time;
+	Pixel::Color colorWithBrightness(uint8_t red, uint8_t green, uint8_t blue) {
+		return Pixel::RGB(mul8x8(red, _brightness), mul8x8(green, _brightness), mul8x8(blue, _brightness));
+	}
+
+	Pixel::Color colorForState(BreakerState_t state) {
+		switch (state) {
+			case breakerStateOff: 		return colorWithBrightness(255, 0, 0); 		// offColor
+			case breakerStateOn: 		return colorWithBrightness(0, 255, 0); 		// onColor
+			case breakerStateTripped: 	return colorWithBrightness(255, 255, 0); 	// trippedColor
+			default: 					return colorWithBrightness(0, 0, 0); 		// blackColor
 		}
+	}
+
+	void showPixels() {
+		if (_strip == NULL || _status == NULL || _colors == NULL) {
+			return;
+		}
+
+		for (int i = 0; i < _length; i++) {
+			_colors[i] = colorForState(_status[i]);
+		}
+		_strip->set(_colors, _length);
+	}
+
+	void setPixel(uint8_t index, BreakerState_t state, bool show = true) {
+		if (index < _length && state != _status[_length - 1 - index]) {
+			_status[_length - 1 - index] = state;
+			if (show) {
+				showPixels();
+			}
+		}
+	}
+
+	void setup(uint8_t pin, uint16_t length) {
+		_brightness = 255;
+		_length = length;
+		_strip = new Pixel(pin, "RGB");
+		_status = new BreakerState_t[_length];
+		_colors = new Pixel::Color[_length];
+		for (auto i=0; i<_length; i++) {
+			_status[i] = breakerStateUnknown;
+		}
+		showPixels();
 	}
 };
 
-//////////////////////////////////////////////
+StatusStrip statusStrip;
 
-float fadeStep(uint16_t duration, uint16_t defaultValue) {
-	return homeKitBrightnessMax * ledUpdateRateInterval / (duration==0 ? defaultValue : duration);
-}
+struct BreakerController : Service::Outlet {
+	SpanCharacteristic* _power;
 
-struct DimmableLED : Service::LightBulb, ButtonDevice {
-	float _fadeUpStep;
-	float _fadeDownStep;
-	float _fadeFastStep;
+	ServoPin* _servo = NULL;
+	double _servoAngle = servoDisable;
+	double _angleOffset = 0;
 
-	DimmableLED(LEDDeviceRec* device, DimInfoRec* dimInfo) : Service::LightBulb(), ButtonDevice(device->buttonPin, dimInfo) {
-		_onOff = new Characteristic::On();
-		_level = new Characteristic::Brightness(100);
-		_level->setRange(0, 100, 1);
+	BreakerController* _buddyBreaker = NULL;
+	StatusStrip* _statusStrip = NULL;
 
-		switch (device->type) {
-			case Device_RGB:
-			case Device_RGBW:
-			case Device_W:
-				_dimInfo->led = new PixelWithSetValue(device->outputPin, device->count, device->type);
-				break;
-			case Device_DotStar_RGB:
-			case Device_DotStar_W:
-				_dimInfo->led = new DotWithSetValue(device->outputPin, device->clockPin, device->count, device->type);
-				break;
-			case Device_LED:
-			default:
-				_dimInfo->led = new LedPinWithSetValue(device->outputPin, 0, 20000);
-				break;
-		}
+	int _sensePin;
+	uint16_t _senseOffLevel;
+	uint16_t _senseOnLevel;
+	int _statusIndex;
 
-		_fadeUpStep = fadeStep(device->fadeUpDuration, defaultFadeUpTime);
-		_fadeDownStep = fadeStep(device->fadeDownDuration, defaultFadeDownTime);
-		_fadeFastStep = fadeStep(device->fadeFastDuration, defaultFadeFastTime);
+	LedPin* _led = NULL;
+	int _ledState = -1;
+	bool _dark = false;
+
+	int _homekitChangeTo = -1;
+
+	int _delayedChangeTo = -1;
+	uint64_t _delayTime = 0;
+
+	uint64_t _senseHoldTime = 0;
+
+	bool _breakerOn;
+
+	uint64_t _moveTime = 0;
+
+	String _anglePrefName;
+	String _onPrefName;
+	String _offPrefName;
+
+	BreakerController(int servoPin, bool reverseServo, int buttonPin, int sensePin, int ledPin, StatusStrip* statusStrip, int statusIndex) : Service::Outlet(){
+
+		new SpanButton(buttonPin, 1000, 5, 0, SpanButton::TRIGGER_ON_LOW);
+
+		_servo = new ServoPin(servoPin, servoDisable, servoMinUSec, servoMaxUSec, (reverseServo) ? servoMinAngle : servoMaxAngle, (reverseServo) ? servoMaxAngle : servoMinAngle);
+
+		_sensePin = sensePin;
+
+		_led = new LedPin(ledPin, 0);
+
+		_statusStrip = statusStrip;
+		_statusIndex = statusIndex;
+
+		_anglePrefName = String("aOffset") + String(_statusIndex);
+		_angleOffset = preferences.getFloat(_anglePrefName.c_str(), 0.0f);
+
+		_onPrefName = String("on") + String(_statusIndex);
+		_senseOnLevel = preferences.getUInt(_onPrefName.c_str(), adcOnLevel);
+		_offPrefName = String("off") + String(_statusIndex);
+		_senseOffLevel = preferences.getUInt(_offPrefName.c_str(), adcOffLevel);
+
+		BreakerState_t state = breakerState();
+		_breakerOn = state == breakerStateOn;
+		_power = new Characteristic::On(_breakerOn);
+
+		setLED(_breakerOn);
+		setStatus(state);
+
+		new Characteristic::OutletInUse(true);
+
+		SerPrintf("Breaker %d - servoPin: %d, buttonPin: %d, sensePin: %d, ledPin: %d, angleOffset: %.1f, onLevel: %d, offLevel: %d\n",
+						_statusIndex, servoPin, buttonPin, _sensePin, ledPin, _angleOffset, _senseOnLevel, _senseOffLevel);
+
+		centerServo();
 	}
 
-	void refreshLevel(bool fast = false) {
-		float currentLevel = _dimInfo->currentLevel;
-		float newLevel = _onOff->getNewVal() * _level->getNewVal();
+	void centerServo() {
+		_moveTime = millis64() - servoPushTimeMS;	// trigger setting servo to center position
+	}
 
-		if (newLevel != currentLevel) {
-			float step;
+	BreakerState_t breakerState(uint16_t* value = NULL) {
+		uint16_t adcVal = analogRead(_sensePin);
 
-			if (fast) {
-				step = (newLevel >= currentLevel) ? _fadeFastStep : -_fadeFastStep;
-				step *= abs(newLevel-currentLevel) / homeKitBrightnessMax;
+		adcVal = analogRead(_sensePin);
+		adcVal = analogRead(_sensePin);
+
+		if (value) {
+			*value = adcVal;
+		}
+
+		if (adcVal >= adcOnLevel) {
+			return breakerStateOn;
+		}
+		else if (adcVal <= adcOffLevel) {
+			return breakerStateOff;
+		}
+		else {
+			return breakerStateTripped;
+		}
+	}
+
+	void setStatus(BreakerState_t state) {
+		_statusStrip->setPixel(_statusIndex, state);
+	}
+
+	void updateLED() {
+		_led->set(_ledState ? ((_dark)? ledDarkBrightness : 100) : 0);
+	}
+
+	void setDark(bool dark) {
+		if (dark != _dark) {
+			_dark = dark;
+			updateLED();
+		}
+	}
+
+	void setLED(bool on) {
+		if (on != _ledState) {
+			_ledState = on;
+			updateLED();
+		}
+	}
+
+	bool update() {
+		if (_power->updated()) {
+			bool newPower = _power->getNewVal();
+
+			if (newPower != _breakerOn) {
+				_homekitChangeTo = newPower;
 			}
-			else {
-				step = (newLevel >= currentLevel) ? _fadeUpStep : -_fadeDownStep;
-			}
-
-			while (_dimInfo->newLevelStep != 0) {};
-
-			_dimInfo->newTargetLevel = newLevel;
-			_dimInfo->newLevelStep = step;
 		}
-	}
-
-	boolean update() {
-		refreshLevel(_level->updated());
-		return(true);  
-	}
-
-	void refreshOutput() {
-		refreshLevel();
-	}
-
-	void button(int pin, int pressType) {
-		handleButton(pressType);
-	}
-};
-
-//////////////////////////////////////////////
-struct FanPWM : Service::Fan, ButtonDevice {
-	SetValue* _output;
-	Pixel *_buttonLED = NULL;
-
-	FanPWM(LEDDeviceRec* device, DimInfoRec* dimInfo) : Service::Fan(), ButtonDevice(device->buttonPin, dimInfo) {
-		_onOff = new Characteristic::Active(false);
-		_level = new Characteristic::RotationSpeed(0, true);
-
-		_level->setRange(0, 100, 1);
-
-		_output = new LedPinWithSetValue(device->outputPin, 0, 25000);
-
-		if (device->clockPin != -1) {
-			_buttonLED = new Pixel(device->clockPin, "GRB");
-		}
-
-		update();
-	}
-
-	boolean update() {
-		float newSpeed = _onOff->getNewVal() * _level->getNewVal();
-		constexpr uint8_t ledBright = 30;
-		Pixel::Color color = Pixel::RGB(0, ledBright/3, 0);
-
-		if (newSpeed > 0) {
-			uint8_t rL = ledBright*6/10;
-			uint8_t rH = ledBright;
-			uint8_t gL = ledBright*6/10;
-			uint8_t gH = 0;
-			uint8_t r = rL + (rH - rL) * newSpeed / homeKitBrightnessMax;
-			uint8_t g = gL + (gH - gL) * newSpeed / homeKitBrightnessMax;
-
-			color = Pixel::RGB(r, g, 0);
-			newSpeed = 10 + 90 * newSpeed / homeKitBrightnessMax;
-		}
-
-		if (_buttonLED) {
-			_buttonLED->set(color);
-		}
-
-		_output->setValue(newSpeed);
-		_dimInfo->currentLevel = newSpeed;
-		_dimInfo->currentCorrectedLevel = gammaCorrect(_dimInfo->currentLevel) * 0.1;
-
 		return true;
 	}
 
-	void refreshOutput() {
-		update();
+	void setServoAngle(double angle, bool silent = false) {
+		if (angle != servoDisable) {
+			angle += _angleOffset;
+		}
+		if (_servo && angle != _servoAngle) {
+			if (!silent) {
+				SerPrintf("%6lld: Breaker %d - set servo to %2.1fº\n", millis64(), _statusIndex, angle);
+			}
+			_servoAngle = angle;
+			_servo->set(angle);
+		}
 	}
 
-	void button(int pin, int pressType) {
-		handleButton(pressType);
-	}
-};
-
-//////////////////////////////////////////////
-struct DigitalPin : Service::Switch, ButtonDevice {
-	int _pin;
-
-	DigitalPin(LEDDeviceRec* device, DimInfoRec* dimInfo) : Service::Switch(), ButtonDevice(device->buttonPin, dimInfo), _pin(device->outputPin) {
-		_onOff = new Characteristic::On();
-		pinMode(_pin,OUTPUT);
-		digitalWrite(_pin, LOW);
+	double getServoAngle() {
+		if (_servoAngle != servoDisable) {
+			return _servoAngle - _angleOffset;
+		}
+		return servoDisable;
 	}
 
-	boolean update() {            
-		bool value = _onOff->getNewVal();
-		digitalWrite(_pin, value);
-		_dimInfo->currentLevel = value * 100;
-		_dimInfo->currentCorrectedLevel = _dimInfo->currentLevel;
-		return(true);
+	void loop() {
+		uint64_t curTime = millis64();
+		uint16_t adcVal = 0;
+		BreakerState_t state = breakerState(&adcVal);
+		bool curOnState = state == breakerStateOn;
+
+		if (_moveTime > 0) {
+			if (curTime >= _moveTime + servoTotalTimeMS) {
+				SerPrintf("%6lld: Breaker %d - disable\n", curTime, _statusIndex);
+				setServoAngle(servoDisable);
+				_moveTime = 0;
+			}
+			else if (curTime >= _moveTime + servoPushTimeMS && getServoAngle() != servoCenterAngle) {
+				SerPrintf("%6lld: Breaker %d - center\n", curTime, _statusIndex);
+				setServoAngle(servoCenterAngle);
+			}
+		}
+		else if (_homekitChangeTo != -1) {
+			if (_homekitChangeTo != _breakerOn) {
+				int servoAngle = (_homekitChangeTo) ? servoMoveAngle : -servoMoveAngle;
+				SerPrintf("%6lld: Breaker %d - set to %d\n", curTime, _statusIndex, servoAngle);
+				setServoAngle(servoAngle);
+				_moveTime = curTime;
+				_breakerOn = _homekitChangeTo;
+			}
+			_homekitChangeTo = -1;
+		}
+		else if (_delayedChangeTo != -1) {
+			if (curTime > _delayTime) {
+				_power->setVal(_delayedChangeTo);
+				_homekitChangeTo = _delayedChangeTo;
+				_delayedChangeTo = -1;
+			}
+		}
+		else if (curTime > _senseHoldTime && curOnState != _power->getVal()) {
+			SerPrintf("%6lld: Breaker %d - state mismatch, setting to %d (state= %d, adc= %d)\n", curTime, _statusIndex, curOnState, state, adcVal);
+			_breakerOn = curOnState;
+			_senseHoldTime = curTime + senseChangeTimeMS;
+			_power->setVal(curOnState);
+		}
+
+		setLED(curOnState);
+		setStatus(state);
 	}
 
-	void refreshOutput() {
-		update();
+	void setPower(bool value, uint32_t afterDelayMS = 0) {
+		if (value != power()) {
+			SerPrintf("%6lld: Breaker %d - setPower to %d\n", millis64(), _statusIndex, value);
+			if (_delayedChangeTo != -1) {
+				_delayedChangeTo = -1;
+			}
+			else if (afterDelayMS) {
+				_delayedChangeTo = value;
+				_delayTime = millis64() + afterDelayMS;
+			}
+			else {
+				_power->setVal(value);
+				_homekitChangeTo = value;
+			}
+		}
 	}
 
-	void button(int pin, int pressType) {
-		handleButton(pressType);
+	bool power() {
+		return (_delayedChangeTo != -1) ? _delayedChangeTo : _power->getVal();
 	}
-};
-	  
-//////////////////////////////////////////////
 
-struct HomeButton : Service::StatelessProgrammableSwitch {
-	SpanCharacteristic* _switchEvent;
-	SpanButton* _button;
-  
-	HomeButton(LEDDeviceRec* device, DimInfoRec* dimInfo) : Service::StatelessProgrammableSwitch() {
-		_switchEvent = new Characteristic::ProgrammableSwitchEvent();
-		_button = new SpanButton(device->buttonPin);
+	void setBuddy(BreakerController* buddy) {
+		_buddyBreaker = buddy;
 	}
 
 	void button(int pin, int pressType) override {
-		_switchEvent->setVal(pressType);
+		if (pressType == SpanButton::SINGLE) {
+			SerPrintf("%6lld: Breaker %d - Button Press\n", millis64(), _statusIndex);
+			setPower(1 - power());
+		}
+		else if (_buddyBreaker && pressType == SpanButton::LONG) {
+			bool newState = 1 - power();
+
+			SerPrintf("%6lld: Breaker %d - Button Long Press\n", millis64(), _statusIndex);
+			setPower(newState);
+			_buddyBreaker->setPower(newState, buddyDelayTimeMS);
+		}
+	}
+
+	void calibrateCenter() {
+		if (_servo) {
+			bool changed = false;
+			bool moved = true;
+			bool done = false;
+			const char* offsetMsg = "Current angle offset: ";
+			String backspaces;
+			for (size_t i = 0; i < strlen(offsetMsg) + 7; ++i) {
+				backspaces += '\b';
+			}
+
+			setServoAngle(servoCenterAngle, true);
+
+			SerPrintf("%6lld: Breaker %d - calibrate center\n", millis64(), _statusIndex);
+			SerPrintf("Use 'u' for up and 'd' for down to adjust the center position\n");
+			SerPrintf("Press <return> to save, press <esc> to exit\n");
+			while (!done) {
+				if (moved) {
+					SerPrintf("%s% 4.1fº", offsetMsg, _angleOffset);
+					Serial.print(backspaces);
+					moved = false;
+				}
+				if (Serial.available()) {
+					char c = Serial.read();
+					if (c == '\n' || c == '\r') {
+						Serial.print("\n");
+						done = true;
+					}
+					else if (c == 27) { // ESC
+						SerPrintf("\n\nCalibration cancelled.\n");
+						done = true;
+						changed = false;
+					}
+					else if (c == 'u') { // up
+						Serial.print('\b');
+						_angleOffset += 1.0;
+						moved = true;
+					}
+					else if (c == 'd') { // down
+						Serial.print('\b');
+						_angleOffset -= 1.0;
+						moved = true;
+					}
+				}
+				if (moved) {
+					setServoAngle(servoCenterAngle, true);
+					changed = true;
+				}
+			}
+			if (changed) {
+				SerPrintf("Calibration complete. Saving new center angle: %2.1fº\n", _angleOffset);
+				preferences.putFloat(_anglePrefName.c_str(), _angleOffset);
+			}
+			else {
+				SerPrintf("No changes made to center angle.\n");
+			}
+
+			setServoAngle(servoDisable, true);
+		}
+	}
+
+	void calibrateSenseLevels() {
+		SerPrintf("%6lld: Breaker %d - calibrate sense levels\n", millis64(), _statusIndex);
+		SerPrintf("Measuring On... %d\n", _senseOnLevel);
+
+		uint16_t onValue, offValue;
+
+		setServoAngle(servoMoveAngle, true);
+		delay(senseChangeTimeMS);
+		breakerState(&onValue);
+
+		SerPrintf("Measuring Off... %d\n", _senseOffLevel);
+
+		setServoAngle(-servoMoveAngle, true);
+		delay(senseChangeTimeMS);
+		breakerState(&offValue);
+
+		setServoAngle(servoCenterAngle, true);
+		delay(servoPushTimeMS);
+
+		uint16_t newOnLevel = offValue + (onValue - offValue) * 3 / 4;
+		uint16_t newOffLevel = offValue + (onValue - offValue) / 2;
+
+		SerPrintf("\nNew On Level: %d, New Off Level: %d (on=%d, off=%d)\n", newOnLevel, newOffLevel, onValue, offValue);
+		SerPrintf("Press 'Y' to accept these new levels, or any other key to reject.\n");
+
+		bool done = false;
+		while (!done) {
+			if (Serial.available()) {
+				char c = Serial.read();
+				if (c == 'Y' || c == 'y') {
+					_senseOnLevel = newOnLevel;
+					_senseOffLevel = newOffLevel;
+					preferences.putUInt(_onPrefName.c_str(), _senseOnLevel);
+					preferences.putUInt(_offPrefName.c_str(), _senseOffLevel);
+					SerPrintf("\nNew sense levels accepted.\n");
+					done = true;
+				}
+				else {
+					SerPrintf("\nNew sense levels rejected.\n");
+					done = true;
+				}
+			}
+		}
+		centerServo();
 	}
 };
 
-//////////////////////////////////////////////
+//--------------------------------------------------------------------
+BreakerController* washer;
+BreakerController* dryer;
+BreakerController* inverter;
+BreakerController* converter;
+
+struct PowerLevel : Service::LightBulb {
+	SpanCharacteristic* _power;
+
+	int _amps;
+
+	PowerLevel(int amps) : Service::LightBulb() {
+		_amps = amps;
+		_power = new Characteristic::On(_amps == currentAmps());
+	}
+
+	int currentAmps() {
+		int amps = -1;
+		bool invPower = inverter->power();
+		bool convPower = converter->power();
+
+		if (invPower && convPower) { amps = 50; }
+		else if (!invPower && convPower) { amps = 20; }
+		else if (!invPower && !convPower) { amps = 15; }
+
+		return amps;
+	}
+
+	void activate() {
+		if (_amps != currentAmps()) {
+			SerPrintf("Activate - %dA\n", _amps);
+
+			bool invPower = inverter->power();
+			bool convPower = converter->power();
+
+			if (_amps == 50) {
+				converter->setPower(true);
+				inverter->setPower(true, !convPower * breakerDelayTimeMS);
+			}
+			else if (_amps == 20) {
+				inverter->setPower(false);
+				converter->setPower(true, invPower * breakerDelayTimeMS);
+			}
+			else if (_amps == 15) {
+				inverter->setPower(false);
+				converter->setPower(false, invPower * breakerDelayTimeMS);
+			}
+		}
+	}
+
+	boolean update() {
+		if (_power->getNewVal() && (_amps != currentAmps())) {
+			activate();
+		}
+		return(true);
+	}
+
+	void loop() {
+		bool on = (_amps == currentAmps());
+
+		if (on != _power->getVal()) {
+			_power->setVal(on);
+		}
+	}
+};
+
+void calibrateUpDown(BreakerController* breaker) {
+	bool changed = false;
+	bool moved = true;
+	bool done = false;
+	bool up = true;
+	const char* offsetMsg = "Current up/down angle: ";
+	String backspaces;
+	for (size_t i = 0; i < strlen(offsetMsg) + 7; ++i) {
+		backspaces += '\b';
+	}
+
+	breaker->setServoAngle(up ? servoMoveAngle : -servoMoveAngle, true);
+
+	SerPrintf("%6lld: Breaker %d - calibrate up/down angle\n", millis64(), breaker->_statusIndex);
+	SerPrintf("Use 'u' for up and 'd' for down to adjust the current move amount\n");
+	SerPrintf("Press <space> to toggle direction\n");
+	SerPrintf("Press <return> to save, press <esc> to exit\n");
+	while (!done) {
+		bool update = false;
+		if (moved) {
+			SerPrintf("%s% 2dº", offsetMsg, servoMoveAngle);
+			Serial.print(backspaces);
+			moved = false;
+		}
+		if (Serial.available()) {
+			char c = Serial.read();
+			if (c == '\n' || c == '\r') {
+				Serial.print("\n");
+				done = true;
+			}
+			else if (c == 27) { // ESC
+				SerPrintf("\n\nCalibration cancelled.\n");
+				done = true;
+				changed = false;
+			}
+			else if (c == 'u') { // up
+				Serial.print('\b');
+				servoMoveAngle += 1.0;
+				moved = true;
+			}
+			else if (c == 'd') { // down
+				Serial.print('\b');
+				servoMoveAngle -= 1.0;
+				moved = true;
+			}
+			else if (c == ' ') { // space
+				up = !up;
+				Serial.print('\b');
+				update = true;
+			}
+		}
+		if (moved) {
+			changed = true;
+			update = true;
+		}
+		if (update) {
+			breaker->setServoAngle(up ? servoMoveAngle : -servoMoveAngle, true);
+		}
+	}
+	if (changed) {
+		SerPrintf("Calibration complete. Saving new up/down angle: %dº\n", servoMoveAngle);
+		preferences.putFloat(movePrefName, servoMoveAngle);
+	}
+	else {
+		SerPrintf("No changes made to up/down angle.\n");
+	}
+
+	breaker->centerServo();
+}
+
+//--------------------------------------------------------------------
+
+PowerLevel* fullPower;
+PowerLevel* reducedPower;
+PowerLevel* minimumPower;
 
 void createDevices() {
 	SPAN_ACCESSORY();   // create Bridge
 
-	for (auto i=0; i<deviceCount; i++) {
-		LEDDeviceRec* device = &deviceList[i];
-		DimInfoRec* dimInfo = &dimmerData[i];
+		SPAN_ACCESSORY("Washer");
+			washer = new BreakerController(servoPinWasher, true, buttonPinWasher, sensePinWasher, ledPinWasher, &statusStrip, statusIndexWasher);
 
-		SerPrintf("*** Creating \'%s\' on pin %d\n", device->name, device->outputPin);
+		SPAN_ACCESSORY("Dryer");
+			dryer = new BreakerController(servoPinDryer, true, buttonPinDryer, sensePinDryer, ledPinDryer, &statusStrip, statusIndexDryer);
 
-		SPAN_ACCESSORY(device->name);
-			switch (device->type) {
-				case Device_Switch:
-					new DigitalPin(device, dimInfo);
-					break;
-				case Device_Fan:
-					new FanPWM(device, dimInfo);
-					break;
-				case Device_Button:
-					new HomeButton(device, dimInfo);
-					break;
-				default:
-					new DimmableLED(device, dimInfo);
-					break;
-			}
-	}
+		SPAN_ACCESSORY("Inverter");
+			inverter = new BreakerController(servoPinInverter, true, buttonPinInverter, sensePinInverter, ledPinInverter, &statusStrip, statusIndexInverter);
+
+		SPAN_ACCESSORY("Converter");
+			converter = new BreakerController(servoPinConverter, false, buttonPinConverter, sensePinConverter, ledPinConverter, &statusStrip, statusIndexConverter);
+
+		washer->setBuddy(dryer);
+		dryer->setBuddy(washer);
+
+		SPAN_ACCESSORY("Full Power");
+			fullPower = new PowerLevel(50);
+
+		SPAN_ACCESSORY("Reduced Power");
+			reducedPower = new PowerLevel(20);
+
+		SPAN_ACCESSORY("Minimum Power");
+			minimumPower = new PowerLevel(15);
 }
 
-void setInitialPins() {
-	for (auto i=0; i<deviceCount; i++) {
-		LEDDeviceRec* device = &deviceList[i];
-		switch (device->type) {
-			case Device_Switch:
-			case Device_Fan:
-			case Device_LED:
-				pinMode(device->outputPin, OUTPUT);
-				digitalWrite(device->outputPin, LOW);
-				break;
-			default:
-				break;
+BreakerController* getBreakerFromCmd(const char *buf) {
+	switch (buf[1] - '0') {
+		case statusIndexWasher: return washer;
+		case statusIndexDryer: return dryer;
+		case statusIndexInverter: return inverter;
+		case statusIndexConverter: return converter;
+		default: {
+			SerPrintf("Invalid index, must be 0-3\n");
+			return NULL;
 		}
 	}
 }
 
-//////////////////////////////////////////////
-
-const char* stringForPDReference(HUSB238_PDSelection ref) {
-	switch (ref) {
-		case PD_SRC_5V: return "5V";
-		case PD_SRC_9V: return "9V";
-		case PD_SRC_12V: return "12V";
-		case PD_SRC_15V: return "15V";
-		case PD_SRC_18V: return "18V";
-		case PD_SRC_20V: return "20V";
-		default: return "Unknown Voltage";
+void cmdCalibrateCenter(const char *buf){
+	BreakerController* breaker = getBreakerFromCmd(buf);
+	if (breaker) {
+		breaker->calibrateCenter();
 	}
 }
 
-bool isPDReferenceValid(HUSB238_PDSelection ref) {
-	switch (ref) {
-		case PD_SRC_5V:
-		case PD_SRC_9V:
-		case PD_SRC_12V:
-		case PD_SRC_15V:
-		case PD_SRC_18V:
-		case PD_SRC_20V:
-			return true;
-		default:
-			return false;
+void cmdCalibrateUpDown(const char *buf){
+	BreakerController* breaker = getBreakerFromCmd(buf);
+	if (breaker) {
+		calibrateUpDown(breaker);
 	}
 }
 
-const char* stringForVoltageDetected(HUSB238_VoltageSetting voltage) {
-	switch (voltage) {
-		case PD_5V: return "5V Detected";
-		case PD_9V: return "9V Detected";
-		case PD_12V: return "12V Detected";
-		case PD_15V: return "15V Detected";
-		case PD_18V: return "18V Detected";
-		case PD_20V: return "20V Detected";
-		default: return "Unknown Voltage Detected";
+void cmdCalibrateSenseLevels(const char *buf){
+	BreakerController* breaker = getBreakerFromCmd(buf);
+	if (breaker) {
+		breaker->calibrateSenseLevels();
 	}
 }
 
-const char* stringForCurrent(HUSB238_CurrentSetting current) {
-	switch (current) {
-		case CURRENT_0_5_A: return "0.5A";
-		case CURRENT_0_7_A: return "0.7A";
-		case CURRENT_1_0_A: return "1.0A";
-		case CURRENT_1_25_A: return "1.25A";
-		case CURRENT_1_5_A: return "1.5A";
-		case CURRENT_1_75_A: return "1.75A";
-		case CURRENT_2_0_A: return "2.0A";
-		case CURRENT_2_25_A: return "2.25A";
-		case CURRENT_2_50_A: return "2.50A";
-		case CURRENT_2_75_A: return "2.75A";
-		case CURRENT_3_0_A: return "3.0A";
-		case CURRENT_3_25_A: return "3.25A";
-		case CURRENT_3_5_A: return "3.5A";
-		case CURRENT_4_0_A: return "4.0A";
-		case CURRENT_4_5_A: return "4.5A";
-		case CURRENT_5_0_A: return "5.0A";
-		default: return "Unknown Current";
-	}
-}
-
-const char* stringForPDResponse(HUSB238_ResponseCodes response) {
-	switch (response) {
-		case NO_RESPONSE: return "No response";
-		case SUCCESS: return "Success";
-		case INVALID_CMD_OR_ARG: return "Invalid command or argument";
-		case CMD_NOT_SUPPORTED: return "Command not supported";
-		case TRANSACTION_FAIL_NO_GOOD_CRC: return "Transaction fail";
-		default: return "Unknown response code";
-	}
-}
-
-void printPDStatus() {
-	SerPrintf("USB PD is set to %s\n", stringForPDReference(husb238.getSelectedPD()));
-	SerPrintf("Current USB Voltage: %s @ %s\n", stringForVoltageDetected(husb238.getPDSrcVoltage()), stringForCurrent(husb238.getPDSrcCurrent()));
-}
-
-void cmdScanPD(const char* buf = NULL) {
-	// Determine whether attached or unattached
-	bool attached = husb238.isAttached();
-	SerPrintf("Attachment Status: %s\n", attached ? "Attached" : "Unattached");
-
-	if (! attached) return;
-	
-	// Test getCCStatus function
-	bool ccStatus = husb238.getCCdirection();
-	SerPrintf("CC Direction: %s\n",ccStatus ? "CC1 connected" : "CC2 Connected");
-
-	// Check if we can get responses to our PD queries!
-	HUSB238_ResponseCodes pdResponse = husb238.getPDResponse();
-	SerPrintf("USB PD query response: %s\n", stringForPDResponse(pdResponse));
-
-	if (pdResponse != SUCCESS)
-		return;
-	
-	Serial.println();
-
-	// What voltages and currents are available from this adapter?
-	Serial.println("Available PD Voltages and Current Detection Test:");
-	for (int i = PD_SRC_5V; i <= PD_SRC_20V; i++) {
-		if (isPDReferenceValid((HUSB238_PDSelection)i)) {
-			bool voltageDetected = husb238.isVoltageDetected((HUSB238_PDSelection)i);
-			HUSB238_CurrentSetting currentDetected = CURRENT_0_5_A;
-
-			if (voltageDetected) {
-				currentDetected = husb238.currentDetected((HUSB238_PDSelection)i);
-			}
-
-			SerPrintf("Voltage %s:  - %s%s\n", stringForPDReference((HUSB238_PDSelection)i), voltageDetected ? " Available - Max Current: " : " Unavailable", voltageDetected ? stringForCurrent(currentDetected) : "");
+void cmdSetBreakerPower(const char *buf){
+	BreakerController* breaker = getBreakerFromCmd(buf);
+	if (breaker) {
+		if (buf[2] == '0') {
+			SerPrintf("Setting Breaker %d to OFF\n", breaker->_statusIndex);
+			breaker->setPower(false);
+		}
+		else if (buf[2] == '1') {
+			SerPrintf("Setting Breaker %d to ON\n", breaker->_statusIndex);
+			breaker->setPower(true);
+		}
+		else {
+			SerPrintf("Invalid command, must be '0' or '1'\n");
 		}
 	}
-
-	Serial.println();
-
-	printPDStatus();
 }
 
-uint32_t lastVoltageCheck = 0;
-uint32_t voltageSetStart = 0;
-HUSB238_PDSelection currentPD = PD_SRC_12V;
-bool voltageSetupComplete = false;
-
-void set12V() {
-	if (husb238.isAttached()) {
-		husb238.selectPD(PD_SRC_12V);
-		husb238.requestPD();
-		voltageSetStart = millis64();
+void cmdSetPowerLevel(const char *buf){
+	if (strcasecmp(buf+1, "min") == 0) {
+		SerPrintf("Setting power level to MINIMUM\n");
+		minimumPower->activate();
+	}
+	else if (strcasecmp(buf+1, "low") == 0) {
+		SerPrintf("Setting power level to LOW\n");
+		reducedPower->activate();
+	}
+	else if (strcasecmp(buf+1, "full") == 0) {
+		SerPrintf("Setting power level to FULL\n");
+		fullPower->activate();
 	}
 	else {
-		voltageSetupComplete = true;
-	}
-}
-
-void updateVoltage() {
-	if (!voltageSetupComplete) {
-		uint32_t now = millis();
-
-		if (now - lastVoltageCheck > 100) {
-			lastVoltageCheck = now;
-
-			HUSB238_VoltageSetting voltage = husb238.getPDSrcVoltage();
-
-			if ((voltage == PD_12V && currentPD == PD_SRC_12V) || (voltage == PD_9V && currentPD == PD_SRC_9V)) {
-				voltageSetupComplete = true;
-				if (voltage == PD_9V) {
-					availableOutputVoltage = output9V;
-				}
-				printPDStatus();
-			}
-			else if (now - voltageSetStart > 1000) {
-				if (currentPD == PD_SRC_12V) {
-					SerPrintf("12V not available, trying 9V...\n");
-					currentPD = PD_SRC_9V;
-					husb238.selectPD(PD_SRC_9V);
-					husb238.requestPD();
-					voltageSetStart = now;
-				}
-				else {
-					SerPrintf("Unable to set USB PD voltage to 12V or 9V.  Please check power supply.");
-					printPDStatus();
-					voltageSetupComplete = true;
-					availableOutputVoltage = outputOther;
-				}
-			}
-		}
+		SerPrintf("Invalid power level. Use 'min', 'low', 'full'.\n");
 	}
 }
 
@@ -934,20 +844,12 @@ void cmdUpdateAccessories(const char *buf){
 	}
 }
 
-void cmdShowCPUStats(const char *buff = NULL) {
+void cmdShowCPUStats(const char *buff = nullptr) {
 	SerPrintf("\n*** CPU Stats ***\n\n");
+
 	SerPrintf("CPU frequency: %ldMHz\n", getCpuFrequencyMhz());
 	SerPrintf("Xtal frequency: %ldMHz\n", getXtalFrequencyMhz());
 	SerPrintf("Bus frequency: %ldMHz\n", getApbFrequency()/1000000);
-
-	uint32_t time = micros();
-	float f = 0;
-	for (auto i=0; i<1000; i++) {
-		f += gammaCorrect(50.0 + (float)i/100.0);
-	}
-	float duration = (micros() - time) / 1000.0 + f * 1e-40;	// multiply f to basically zero, avoids unused variable warning
-	SerPrintf("Timing test: pow(x) = %0.2fuS\n", duration);
-
 	SerPrintf("Total heap: %ld\n", ESP.getHeapSize());
 	SerPrintf("Free heap: %ld\n", ESP.getFreeHeap());
 	SerPrintf("Total PSRAM: %ld\n", ESP.getPsramSize());
@@ -959,10 +861,14 @@ void cmdShowCPUStats(const char *buff = NULL) {
 void addCommands() {
 	new SpanUserCommand('s',"show CPU stats", cmdShowCPUStats);
 	new SpanUserCommand('u',"update accessory database", cmdUpdateAccessories);
-	new SpanUserCommand('d',"scan USB PD", cmdScanPD);
+	new SpanUserCommand('p',"set power for breaker N - 0=off, 1=on)", cmdSetBreakerPower);
+	new SpanUserCommand('w',"set power level - 'min', 'low', 'full'", cmdSetPowerLevel);
+	new SpanUserCommand('l',"calibrate sense levels for breaker N", cmdCalibrateSenseLevels);
+	new SpanUserCommand('m',"calibrate servo up/down move for breaker N", cmdCalibrateUpDown);
+	new SpanUserCommand('c',"calibrate servo center for breaker N", cmdCalibrateCenter);
 }
 
-//////////////////////////////////////////////
+//--------------------------------------------------------------------
 
 void flashIndicator(uint32_t color, uint16_t count, uint16_t period) {
 	for (auto i=0; i<count; i++) {
@@ -988,54 +894,93 @@ void wifiReady(int ready) {
 		setIndicator(readyColor, true);
 	}
 	SerPrintf("WIFI: Ready.\n");
-
 }
 
 TaskHandle_t t;
 
-void setup() {
-	setInitialPins();
+double mapf(double x, double in_min, double in_max, double out_min, double out_max) {
+	return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
 
+void setup() {
 	setupIndicator();
+	statusStrip.setup(statusStripPin, statusStripLength);
 
 	flashIndicator(flashColor, 20, 100);
 	setIndicator(startColor, true);
 
 	Serial.begin(115200);
-	SerPrintf("Home-LED Startup\n");
+	SerPrintf("Power Center Controller Startup\n");
+
+	SerPrintf("Setup status LED strip\n");
+	statusStrip.setBrightness(statusStripBrightBrightness, false);
+
+	for (auto i=-1; i<=statusStripLength; i++) {
+		statusStrip.setPixel(i-1, breakerStateUnknown, false);
+		statusStrip.setPixel(i+1, breakerStateOff, false);
+		statusStrip.setPixel(i, breakerStateOn, false);
+		statusStrip.showPixels();
+		delay(100);
+	}
+
+	SerPrintf("Initialize Preferences System\n");
+	preferences.begin("PwrPrefs", false);
+	servoMoveAngle = preferences.getFloat(movePrefName, initialServoMoveAngle);
+	SerPrintf("Servo move angle: %d\n", servoMoveAngle);
 
 	SerPrintf("Init HomeSpan\n");
 	homeSpan.setSketchVersion(versionString);
 	homeSpan.setConnectionCallback(wifiReady);
 	homeSpan.setStatusCallback(statusChanged);
-	homeSpan.enableOTA(otaPassword);
 	homeSpan.begin(Category::Bridges, displayName, DEFAULT_HOST_NAME, modelName);
 
 	SerPrintf("Create devices\n");
 	createDevices();
 	addCommands();
 
-	SerPrintf("Create dimmer task\n");
-	xTaskCreate(dimmerTask, "LED_Dimmer", dimmerTaskStackSize, NULL, 0, &t);
-
 	SerPrintf("Wait for WiFi...\n");
 	setIndicator(connectingColor, true);
 
-	#ifdef CPU_FREQUENCY
-		setCpuFrequencyMhz(CPU_FREQUENCY);
-	#endif
+	SerPrintf("Init complete.\n");
+}
 
-	SerPrintf("Initialize HUSB238...\n");
-	if (husb238.begin(HUSB238_I2CADDR_DEFAULT, &Wire)) {
-		set12V();
-	} else {
-		Serial.println("Couldn't find HUSB238, check your wiring?");
+void checkAmbientLight() {
+	static uint64_t ambientCheckTime = 0;
+	uint64_t curTime = millis64();
+	if (curTime >= ambientCheckTime) {
+		ambientCheckTime = curTime + lightCheckTimeMS;
+		analogRead(ambientLightPin);
+		analogRead(ambientLightPin);
+		uint16_t ambientLight = analogRead(ambientLightPin);
+		// SerPrintf("Ambient Light: %d\n", ambientLight);
+		if (ambientLight <= darkLowThreshold) {
+			statusStrip.setBrightness(statusStripDarkBrightness);
+		}
+		else if (ambientLight >= darkHighThreshold) {
+			statusStrip.setBrightness(statusStripBrightBrightness);
+		}
 	}
+}
 
-  SerPrintf("Init complete.\n");
+void showADCStatus() {
+	static uint64_t nextStatusTime = 0;
+
+	uint64_t curTime = millis64();
+	if (curTime >= nextStatusTime) {
+		nextStatusTime = curTime + 1000;
+
+		uint16_t adcWasher = analogRead(sensePinWasher);
+		uint16_t adcDryer = analogRead(sensePinDryer);
+		uint16_t adcInverter = analogRead(sensePinInverter);
+		uint16_t adcConverter = analogRead(sensePinConverter);
+
+		SerPrintf("%6lu: ADC Washer: %4d, Dryer: %4d, Inverter: %4d, Converter: %4d\n", millis(), adcWasher, adcDryer, adcInverter, adcConverter);
+	}
 }
 
 void loop() {
 	homeSpan.poll();
-	updateVoltage();
+
+	checkAmbientLight();
+	showADCStatus();
 }
