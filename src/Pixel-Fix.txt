@@ -1,0 +1,24 @@
+void Pixel::set(Color *c, int nPixels, boolean multiColor){
+
+  if(channel<0 || nPixels==0)
+    return;
+
+  uint8_t buffer[nPixels * bytesPerPixel];
+  int index=0;        // points to current slot in ping/pong structure
+  int remaining=nPixels;
+
+  rmt_ll_set_group_clock_src(&RMT, channel, RMT_CLK_SRC_DEFAULT, 1, 0, 0);        // ensure use of DEFAULT CLOCK, which is always 80 MHz, without any scaling
+  
+  do {
+    for(int i=0;i<bytesPerPixel;i++)                                              // remap colors into ping/pong structure
+      buffer[index++]=c->col[map[i]];
+
+    c+=multiColor;
+  } while(--remaining>0);
+
+  rmt_tx_wait_all_done(tx_chan,-1);                                             // wait until any outstanding data is transmitted
+  rmt_transmit(tx_chan, encoder, buffer, nPixels * bytesPerPixel, &tx_config);   // transmit data
+
+  rmt_tx_wait_all_done(tx_chan,-1);                                               // wait until final data is transmitted
+  delayMicroseconds(resetTime);                                                   // end-of-marker delay
+}
