@@ -138,6 +138,7 @@ uint64_t millis64() {
 
 uint16_t analogReadClean(uint8_t pin) {
 	analogRead(pin);
+	analogRead(pin);
 	return analogRead(pin);
 }
 
@@ -250,6 +251,7 @@ struct StatusStrip {
 		_brightness = 255;
 		_length = length;
 		_strip = new Pixel(pin, "RGB");
+		_strip->setTiming(0.35, 0.8, 0.7, 0.6, 80.0);
 		_status = new BreakerState_t[_length];
 		_colors = new Pixel::Color[_length];
 		for (auto i=0; i<_length; i++) {
