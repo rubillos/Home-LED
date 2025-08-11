@@ -12,7 +12,23 @@
 			"esp_lcd_types.h": "c",
 			"lcd_types.h": "c",
 			"lv_obj_private.h": "c",
-			"cmath": "cpp"
+			"cmath": "cpp",
+			"chrono": "cpp",
+			"deque": "cpp",
+			"exception": "cpp",
+			"forward_list": "cpp",
+			"functional": "cpp",
+			"istream": "cpp",
+			"locale": "cpp",
+			"map": "cpp",
+			"memory": "cpp",
+			"new": "cpp",
+			"ostream": "cpp",
+			"random": "cpp",
+			"string": "cpp",
+			"utility": "cpp",
+			"*.inc": "cpp",
+			"algorithm": "cpp"
 		}
 	}
 }
