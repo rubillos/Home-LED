@@ -1,0 +1,170 @@
+/*********************************************************************************
+ *  MIT License
+ *  
+ *  Copyright (c) 2020-2024 Gregg E. Berman
+ *  
+ *  https://github.com/HomeSpan/HomeSpan
+ *  
+ *  Permission is hereby granted, free of charge, to any person obtaining a copy
+ *  of this software and associated documentation files (the "Software"), to deal
+ *  in the Software without restriction, including without limitation the rights
+ *  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ *  copies of the Software, and to permit persons to whom the Software is
+ *  furnished to do so, subject to the following conditions:
+ *  
+ *  The above copyright notice and this permission notice shall be included in all
+ *  copies or substantial portions of the Software.
+ *  
+ *  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ *  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ *  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ *  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ *  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ *  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ *  SOFTWARE.
+ *  
+ ********************************************************************************/
+ 
+////////////////////////////////////////////
+//           Addressable LEDs             //
+////////////////////////////////////////////
+
+#include "Pixel2.h"
+
+////////////////////////////////////////////
+//     Single-Wire RGB/RGBW NeoPixels     //
+////////////////////////////////////////////
+
+IRAM_ATTR size_t Pixel2::pixelEncodeCallback(const void *data, size_t data_size,
+                     size_t symbols_written, size_t symbols_free,
+                     rmt_symbol_word_t *symbols, bool *done, void *arg) {
+  rmt_pixel_encoder_config_t* encoder_config = (rmt_pixel_encoder_config_t *)arg;
+  Pixel2* pixel = encoder_config->pixel;
+  Pixel::Color* colors = (Pixel::Color *)data;
+  int bytesPerPixel = pixel->bytesPerPixel;
+  int symbolsPerPixel = 8 * bytesPerPixel;
+  int totalPixelCount = data_size / sizeof(Pixel::Color);
+  int pixelsWritten = symbols_written / symbolsPerPixel;
+  bool multiColor = encoder_config->multiColor;
+  size_t symbolsGenerated = 0;
+
+  while (pixelsWritten < totalPixelCount && symbols_free >= symbolsPerPixel) {
+    Pixel::Color* srcColor = colors + (multiColor ? pixelsWritten : 0);
+
+    for (auto i=0; i<bytesPerPixel; i++) {
+      uint8_t byte = srcColor->col[pixel->map[i]];
+      for (auto j = 7; j >= 0; j--) {
+        symbols[symbolsGenerated++] = (byte & (1 << j)) ? encoder_config->bit1 : encoder_config->bit0;
+        symbols_free--;
+      }
+    }
+    pixelsWritten++;
+  }
+
+  *done = (pixelsWritten >= totalPixelCount);
+  return symbolsGenerated;
+};
+
+Pixel2::Pixel2(int pin, const char *pixelType){
+
+  this->pin=pin;
+
+  rmt_tx_channel_config_t tx_chan_config;
+  memset((void *)&tx_chan_config, 0, sizeof(rmt_tx_channel_config_t));
+  tx_chan_config.clk_src = RMT_CLK_SRC_DEFAULT;                       // always use 80MHz clock source
+  tx_chan_config.gpio_num = (gpio_num_t)pin;                          // GPIO number
+  tx_chan_config.mem_block_symbols = SOC_RMT_MEM_WORDS_PER_CHANNEL;   // set number of symbols to match those in a single channel block
+  tx_chan_config.resolution_hz = 80 * 1000 * 1000;                    // set to 80MHz
+  tx_chan_config.intr_priority = 3;                                   // medium interrupt priority
+  tx_chan_config.trans_queue_depth = 4;                               // set the number of transactions that can pend in the background
+  tx_chan_config.flags.invert_out = false;                            // do not invert output signal
+  tx_chan_config.flags.with_dma = false;                              // use RMT channel memory, not DMA (most chips do not support use of DMA anyway)
+  tx_chan_config.flags.io_loop_back = false;                          // do not use loop-back mode
+  tx_chan_config.flags.io_od_mode = false;                            // do not use open-drain output
+  
+  if(!GPIO_IS_VALID_OUTPUT_GPIO(pin)){
+    ESP_LOGE(PIXEL_TAG,"Can't create Pixel(%d) - invalid output pin",pin);
+    return;    
+  }
+
+  if(rmt_new_tx_channel(&tx_chan_config, &tx_chan)!=ESP_OK){
+    ESP_LOGE(PIXEL_TAG,"Can't create Pixel(%d) - no open channels",pin);
+    return;
+  }
+  
+  bytesPerPixel=0;
+  size_t len=strlen(pixelType);
+  boolean invalidMap=false;
+  char v[]="RGBWC01234-";                                 // list of valid mapping characters for pixelType
+  
+  for(int i=0;i<len && i<5;i++){                          // parse and then validate pixelType
+    int index=strchrnul(v,toupper(pixelType[i]))-v;
+    if(index==strlen(v))                                  // invalid mapping character found
+      invalidMap=true;
+    map[bytesPerPixel++]=index%5;                         // create pixel map and compute number of bytes per pixel
+  }
+
+  if(bytesPerPixel<3 || len>5 || invalidMap){
+    ESP_LOGE(PIXEL_TAG,"Can't create Pixel(%d, \"%s\") - invalid pixelType",pin,pixelType);
+    return;
+  }
+
+  sscanf(pixelType,"%ms",&pType);                 // save pixelType for later use with hasColor()
+  
+  rmt_enable(tx_chan);                            // enable channel
+  channel=((int *)tx_chan)[0];                    // get channel number
+
+  memset((void *)&tx_config, 0, sizeof(rmt_transmit_config_t));  
+
+  rmt_simple_encoder_config_t simple_config;
+  simple_config.callback = pixelEncodeCallback;                // set callback function to encode data
+  simple_config.min_chunk_size = 8 * bytesPerPixel;
+  simple_config.arg = &encoder_config;
+  rmt_new_simple_encoder(&simple_config, &encoder);           // create simple encoder
+
+  setTiming(0.32, 0.88, 0.64, 0.56, 80.0);    // set default timing parameters (suitable for most SK68 and WS28 RGB pixels)
+
+  onColor.HSV(0,100,100,0);
+}
+
+///////////////////
+
+Pixel2 *Pixel2::setTiming(float high0, float low0, float high1, float low1, uint32_t lowReset){
+
+  if(channel<0)
+    return(this);
+  
+  memset((void *)&encoder_config, 0, sizeof(rmt_pixel_encoder_config_t));
+
+  encoder_config.bit0.level0=1;
+  encoder_config.bit0.duration0=high0*80+0.5;
+  encoder_config.bit0.level1=0;
+  encoder_config.bit0.duration1=low0*80+0.5;
+  
+  encoder_config.bit1.level0=1;
+  encoder_config.bit1.duration0=high1*80+0.5;
+  encoder_config.bit1.level1=0;
+  encoder_config.bit1.duration1=low1*80+0.5;
+
+  resetTime=lowReset;
+  return(this);
+}
+
+///////////////////
+
+void Pixel2::set(Pixel::Color *c, int nPixels, boolean multiColor){
+
+  if(channel<0 || nPixels==0)
+    return;
+
+  rmt_ll_set_group_clock_src(&RMT, channel, RMT_CLK_SRC_DEFAULT, 1, 0, 0);        // ensure use of DEFAULT CLOCK, which is always 80 MHz, without any scaling
+
+  encoder_config.multiColor = multiColor;
+  encoder_config.pixel = this;
+
+  rmt_tx_wait_all_done(tx_chan,-1);                                             // wait until any outstanding data is transmitted
+  rmt_transmit(tx_chan, encoder, c, nPixels * sizeof(Pixel::Color), &tx_config);       // transmit data
+
+  rmt_tx_wait_all_done(tx_chan,-1);                                               // wait until final data is transmitted
+  delayMicroseconds(resetTime);                                                   // end-of-marker delay
+}

@@ -2,6 +2,7 @@
 
 #include "HomeSpan.h" 
 #include <Preferences.h>
+#include "Pixel2.h"
 
 //--------------------------------------------------------------------
 
@@ -67,7 +68,6 @@ constexpr double servoMaxAngle = 90;
 constexpr int servoCenterAngle = 0;
 
 constexpr uint32_t servoPushTimeMS = 250;
-constexpr uint32_t servoTotalTimeMS = servoPushTimeMS * 2;
 
 constexpr uint32_t senseChangeTimeMS = servoPushTimeMS + 50;
 constexpr uint32_t breakerDelayTimeMS = servoPushTimeMS + 100;
@@ -88,23 +88,24 @@ constexpr uint32_t statusUpdateRateMS = 1000;
 
 //--------------------------------------------------------------------
 
-Pixel indicator(indicatorDataPin, "GRB");
+constexpr const char* displayName = "PwrCenter-Controller";
+constexpr const char* modelName = "PwrCenter-Controller-ESP32-S3";
+constexpr const char* versionString = "v1.0";
+
+//--------------------------------------------------------------------
+
+Pixel2 indicator(indicatorDataPin, "GRB");
 uint8_t pixelBrightness = 32;
 
 //--------------------------------------------------------------------
 
 Preferences preferences;
 
+const char* prefsPartitionName = "PwrPrefs";
 const char* movePrefName = "moveAngle";
 
 constexpr int16_t initialServoMoveAngle = 20;
 int16_t servoMoveAngle = initialServoMoveAngle;
-
-//--------------------------------------------------------------------
-
-constexpr const char* displayName = "PwrCenter-Controller";
-constexpr const char* modelName = "PwrCenter-Controller-ESP32-S3";
-constexpr const char* versionString = "v1.0";
 
 //--------------------------------------------------------------------
 
@@ -182,6 +183,21 @@ void setIndicator(uint32_t color) {
 }
 
 //--------------------------------------------------------------------
+bool waitForY() {
+	while (true) {
+		if (Serial.available()) {
+			char c = Serial.read();
+			if (c == 'Y' || c == 'y') {
+				return true;
+			}
+			else if (c == 'N' || c == 'n') {
+				return false;
+			}
+		}
+	}
+}
+
+//--------------------------------------------------------------------
 typedef enum {
 	breakerStateOff = 0,
 	breakerStateOn = 1,
@@ -190,7 +206,7 @@ typedef enum {
 } BreakerState_t;
 
 struct StatusStrip {
-	Pixel *_strip = NULL;
+	Pixel2 *_strip = NULL;
 	uint16_t _length;
 	uint8_t _brightness = 255;
 	BreakerState_t* _status = NULL;
@@ -250,7 +266,7 @@ struct StatusStrip {
 	void begin(uint8_t pin, uint16_t length) {
 		_brightness = 255;
 		_length = length;
-		_strip = new Pixel(pin, "RGB");
+		_strip = new Pixel2(pin, "RGB");
 		_strip->setTiming(0.35, 0.8, 0.7, 0.6, 80.0);
 		_status = new BreakerState_t[_length];
 		_colors = new Pixel::Color[_length];
@@ -263,8 +279,12 @@ struct StatusStrip {
 
 StatusStrip statusStrip;
 
+constexpr int trippedSensorTrue = Characteristic::ContactSensorState::DETECTED;
+constexpr int trippedSensorFalse = Characteristic::ContactSensorState::NOT_DETECTED;
+
 struct BreakerController : Service::Outlet {
 	SpanCharacteristic* _power;
+	SpanCharacteristic* _tripped;
 
 	ServoPin* _servo = NULL;
 	double _servoAngle = servoDisable;
@@ -298,12 +318,17 @@ struct BreakerController : Service::Outlet {
 
 	BreakerController(int servoPin, bool reverseServo, int pinButton, int pinSense, int ledPin, StatusStrip* statusStrip, int statusIndex) : Service::Outlet(){
 
+		new Characteristic::OutletInUse(true);
+
+		_pinSense = pinSense;
+		BreakerState_t state = breakerState();
+		_breakerOn = state == breakerStateOn;
+		_power = new Characteristic::On(_breakerOn);
+
 		new SpanButton(pinButton, 1000, 5, 0, SpanButton::TRIGGER_ON_LOW);
 
 		_servo = new ServoPin(servoPin, servoDisable, servoMinUSec, servoMaxUSec, reverseServo ? servoMinAngle : servoMaxAngle, reverseServo ? servoMaxAngle : servoMinAngle);
 		_led = new LedPin(ledPin, 0);
-
-		_pinSense = pinSense;
 
 		_statusStrip = statusStrip;
 		_statusIndex = statusIndex;
@@ -317,14 +342,11 @@ struct BreakerController : Service::Outlet {
 		_senseOnLevel = preferences.getUInt(_onPrefName.c_str(), adcOnLevel);
 		_senseOffLevel = preferences.getUInt(_offPrefName.c_str(), adcOffLevel);
 
-		BreakerState_t state = breakerState();
-		_breakerOn = state == breakerStateOn;
-		_power = new Characteristic::On(_breakerOn);
-
 		setLED(_breakerOn);
 		setStatus(state);
 
-		new Characteristic::OutletInUse(true);
+		new Service::ContactSensor();
+			_tripped = new Characteristic::ContactSensorState(trippedSensorFalse);
 
 		SerPrintf("Breaker %d - servoPin: %d, pinButton: %d, pinSense: %d, ledPin: %d, angleOffset: %.1f, onLevel: %d, offLevel: %d\n",
 						_statusIndex, servoPin, pinButton, _pinSense, ledPin, _angleOffset, _senseOnLevel, _senseOffLevel);
@@ -416,20 +438,33 @@ struct BreakerController : Service::Outlet {
 		bool curOnState = state == breakerStateOn;
 
 		if (_servoMoveTime > 0) {
-			if (curTime > _servoMoveTime + servoTotalTimeMS) {
+			if (curTime > _servoMoveTime + servoPushTimeMS * 2) {
 				setServoAngle(servoDisable);
 				_servoMoveTime = 0;
 			}
-			else if (curTime > _servoMoveTime + servoPushTimeMS && getServoAngle() != servoCenterAngle) {
-				setServoAngle(servoCenterAngle);
+			else if (curTime > _servoMoveTime + servoPushTimeMS) {
+				if (getServoAngle() != servoCenterAngle) {
+					setServoAngle(servoCenterAngle);
+				}
+			}
+			else if (curTime > _servoMoveTime - servoPushTimeMS) {
+				if (_breakerOn && getServoAngle() != servoMoveAngle) {
+					setServoAngle(servoMoveAngle);
+				}
 			}
 		}
 		else if (_changeToValue != -1) {
 			if (_changeToValue != _breakerOn) {
 				_breakerOn = _changeToValue;
-				setServoAngle(_changeToValue ? servoMoveAngle : -servoMoveAngle);
-				_servoMoveTime = curTime;
-				_senseHoldTime = curTime + senseChangeTimeMS;
+				if (state == breakerStateTripped) {
+					setServoAngle(-servoMoveAngle);
+					_servoMoveTime = curTime + servoPushTimeMS * 2;
+				}
+				else {
+					setServoAngle(_changeToValue ? servoMoveAngle : -servoMoveAngle);
+					_servoMoveTime = curTime;
+				}
+				_senseHoldTime = _servoMoveTime + senseChangeTimeMS;
 			}
 			_changeToValue = -1;
 		}
@@ -440,10 +475,19 @@ struct BreakerController : Service::Outlet {
 				_delayedChangeTo = -1;
 			}
 		}
-		else if (curTime > _senseHoldTime && curOnState != _power->getVal()) {
-			SerPrintf("%6lld: Breaker %d - state mismatch, setting to %d (state=%d, adc=%d, on=%d, off=%d)\n", curTime, _statusIndex, curOnState, state, adcVal, _senseOnLevel, _senseOffLevel);
-			_breakerOn = curOnState;
-			_power->setVal(curOnState);
+		else if (curTime > _senseHoldTime) {
+			int tripped = (state == breakerStateTripped) ? trippedSensorTrue : trippedSensorFalse;
+
+			if (tripped != _tripped->getVal()) {
+				_tripped->setVal(tripped);
+				SerPrintf("%6lld: Breaker %d - tripped state changed to %s\n", curTime, _statusIndex, tripped == trippedSensorTrue ? "TRIPPED" : "NOT TRIPPED");
+			}
+			
+			if (curOnState != _power->getVal()) {
+				SerPrintf("%6lld: Breaker %d - state mismatch, setting to %d (state=%d, adc=%d, on=%d, off=%d)\n", curTime, _statusIndex, curOnState, state, adcVal, _senseOnLevel, _senseOffLevel);
+				_breakerOn = curOnState;
+				_power->setVal(curOnState);
+			}
 		}
 
 		setLED(curOnState);
@@ -477,13 +521,13 @@ struct BreakerController : Service::Outlet {
 
 	void button(int pin, int pressType) override {
 		if (pressType == SpanButton::SINGLE) {
-			SerPrintf("%6lld: Breaker %d - Button Press\n", millis64(), _statusIndex);
+			SerPrintf("%6lld: Breaker %d - Button Press - toggle power\n", millis64(), _statusIndex);
 			setPower(!power());
 		}
 		else if (_buddyBreaker && pressType == SpanButton::LONG) {
 			bool newState = !power();
 
-			SerPrintf("%6lld: Breaker %d - Button Long Press\n", millis64(), _statusIndex);
+			SerPrintf("%6lld: Breaker %d - Button Long Press - toggle power, local and buddy\n", millis64(), _statusIndex);
 			setPower(newState);
 			_buddyBreaker->setPower(newState, buddyDelayTimeMS);
 		}
@@ -569,23 +613,15 @@ struct BreakerController : Service::Outlet {
 		SerPrintf("\nNew On Level: %d, New Off Level: %d (on=%d, off=%d)\n", newOnLevel, newOffLevel, onValue, offValue);
 		SerPrintf("Press 'Y' to accept these new levels, or any other key to reject.\n");
 
-		bool done = false;
-		while (!done) {
-			if (Serial.available()) {
-				char c = Serial.read();
-				if (c == 'Y' || c == 'y') {
-					_senseOnLevel = newOnLevel;
-					_senseOffLevel = newOffLevel;
-					preferences.putUInt(_onPrefName.c_str(), _senseOnLevel);
-					preferences.putUInt(_offPrefName.c_str(), _senseOffLevel);
-					SerPrintf("\nNew sense levels ACCEPTED.\n");
-					done = true;
-				}
-				else {
-					SerPrintf("\nNew sense levels REJECTED.\n");
-					done = true;
-				}
-			}
+		if (waitForY()) {
+			_senseOnLevel = newOnLevel;
+			_senseOffLevel = newOffLevel;
+			preferences.putUInt(_onPrefName.c_str(), _senseOnLevel);
+			preferences.putUInt(_offPrefName.c_str(), _senseOffLevel);
+			SerPrintf("\nNew sense levels ACCEPTED.\n");
+		}
+		else {
+			SerPrintf("\nNew sense levels REJECTED.\n");
 		}
 		centerServo();
 	}
@@ -823,6 +859,22 @@ void cmdSetPowerLevel(const char *buf){
 	}
 }
 
+void cmdClearPreferences(const char *buf) {
+	SerPrintf("%6lld: Clear preferences\n", millis64());
+	SerPrintf("This will remove all saved settings, including breaker angles and sense levels.\n");
+	SerPrintf("Press 'Y' to confirm and restart, or any other key to cancel.\n");
+
+	if (waitForY()) {
+		preferences.clear();
+		preferences.end();
+		SerPrintf("Preferences cleared. Restarting...\n");
+		ESP.restart();
+	}
+	else {
+		SerPrintf("Clear preferences cancelled.\n");
+	}
+}
+
 void cmdUpdateAccessories(const char *buf){
 
 	if(homeSpan.updateDatabase()) {
@@ -860,6 +912,7 @@ void addCommands() {
 	new SpanUserCommand('a',"toggle ADC status", cmdToggleADCStatus);
 	new SpanUserCommand('p',"set breaker N to 0=off, 1=on)", cmdSetBreakerPower);
 	new SpanUserCommand('w',"set power level - 'min', 'low', 'full'", cmdSetPowerLevel);
+	new SpanUserCommand('x',"clear preferences", cmdClearPreferences);
 	new SpanUserCommand('l',"measure sense levels for breaker N", cmdMeasureSenseLevels);
 	new SpanUserCommand('m',"calibrate servo up/down move for breaker N", cmdCalibrateUpDown);
 	new SpanUserCommand('c',"calibrate servo center for breaker N", cmdCalibrateCenter);
@@ -917,7 +970,7 @@ void setup() {
 	}
 
 	SerPrintf("Initialize Preferences\n");
-	preferences.begin("PwrPrefs", false);
+	preferences.begin(prefsPartitionName, false);
 	servoMoveAngle = preferences.getFloat(movePrefName, initialServoMoveAngle);
 	SerPrintf("Servo move angle: %d\n", servoMoveAngle);
 
