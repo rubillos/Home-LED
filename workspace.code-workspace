@@ -28,7 +28,9 @@
 			"string": "cpp",
 			"utility": "cpp",
 			"*.inc": "cpp",
-			"algorithm": "cpp"
+			"algorithm": "cpp",
+			"bitset": "cpp",
+			"*.txt": "cpp"
 		}
 	}
 }
