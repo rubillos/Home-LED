@@ -3,6 +3,7 @@
 #include "HomeSpan.h" 
 #include <Preferences.h>
 #include "Pixel2.h"
+#include "BlinkableLEDPin.h"
 
 //--------------------------------------------------------------------
 
@@ -59,18 +60,18 @@ constexpr uint8_t pinSenseDryer = 18;
 constexpr uint8_t pinSenseInverter = 14;
 constexpr uint8_t pinSenseConverter = 12;
 
-constexpr uint8_t pinLedWasher = TX;	// 43
-constexpr uint8_t pinLedDryer = SDA;	// 8
+constexpr uint8_t pinLedWasher = SDA;	// 8
+constexpr uint8_t pinLedDryer = TX;	// 43
 constexpr uint8_t pinLedInverter = MISO;	// 37
 constexpr uint8_t pinLedConverter = SCL;	// 9
 
-constexpr uint8_t pinButtonWasher = 7;
-constexpr uint8_t pinButtonDryer = 3;
+constexpr uint8_t pinButtonWasher = 3;
+constexpr uint8_t pinButtonDryer = 7;
 constexpr uint8_t pinButtonInverter = 1;
 constexpr uint8_t pinButtonConverter = 38;
 
-constexpr uint8_t statusIndexWasher = 0;
-constexpr uint8_t statusIndexDryer = 1;
+constexpr uint8_t statusIndexWasher = 1;
+constexpr uint8_t statusIndexDryer = 0;
 constexpr uint8_t statusIndexInverter = 2;
 constexpr uint8_t statusIndexConverter = 3;
 
@@ -105,6 +106,9 @@ constexpr uint32_t trippedStableDurationMS = 300;
 
 constexpr uint8_t ledDarkBrightness = 10;
 constexpr uint8_t ledBrightBrightness = 100;
+
+constexpr uint16_t ledTrippedRateMS = 500;
+constexpr float ledTrippedPeriod = 0.4;
 
 constexpr uint8_t statusStripDarkBrightness = 1;
 constexpr uint8_t statusStripBrightBrightness = 20;
@@ -380,9 +384,10 @@ struct BreakerController : Service::Outlet {
 	bool _lastTripped = false;
 	uint64_t _lastTrippedTime = 0;
 
-	LedPin* _led = NULL;
+	BlinkableLEDPin* _led = NULL;
+	Blinker* _blinker = NULL;
 	int _pinLED;
-	int _ledState = -1;
+	BreakerState_t _ledState = breakerStateUnknown;
 	bool _dark = false;
 
 	bool _breakerOn;
@@ -414,7 +419,9 @@ struct BreakerController : Service::Outlet {
 		_servo = new ServoPin(pinServo, NAN, servoMinUSec, servoMaxUSec, reverseServo ? servoMinAngle : servoMaxAngle, reverseServo ? servoMaxAngle : servoMinAngle);
 
 		_pinLED = pinLED;
-		_led = new LedPin(pinLED, 0);
+		_led = new BlinkableLEDPin(pinLED, 0);
+		_blinker = new Blinker(_led);
+		setDark(_dark, true);
 
 		_statusStrip = statusStrip;
 		_statusIndex = statusIndex;
@@ -437,7 +444,7 @@ struct BreakerController : Service::Outlet {
 		_breakerOn = state == breakerStateOn;
 		_power = new Characteristic::On(_breakerOn);
 
-		setLED(_breakerOn);
+		setLED(state);
 		setStatus(state);
 
 		new Service::ContactSensor();
@@ -508,19 +515,24 @@ struct BreakerController : Service::Outlet {
 	}
 
 	void updateLED() {
-		_led->set(_ledState ? (_dark ? ledDarkBrightness : ledBrightBrightness) : 0);
+		switch(_ledState) {
+			case breakerStateOn:		_blinker->on();											break;
+			case breakerStateTripped:	_blinker->start(ledTrippedRateMS, ledTrippedPeriod);	break;
+			default:					_blinker->off();										break;
+		}
 	}
 
-	void setDark(bool dark) {
-		if (dark != _dark) {
+	void setDark(bool dark, bool force) {
+		if (dark != _dark || force) {
 			_dark = dark;
+			_led->setOnLevel(_dark ? ledDarkBrightness : ledBrightBrightness);
 			updateLED();
 		}
 	}
 
-	void setLED(bool on) {
-		if (on != _ledState) {
-			_ledState = on;
+	void setLED(BreakerState_t state) {
+		if (state != _ledState) {
+			_ledState = state;
 			updateLED();
 		}
 	}
@@ -622,7 +634,7 @@ struct BreakerController : Service::Outlet {
 			}
 		}
 
-		setLED(curOnState);
+		setLED(state);
 		setStatus(state);
 	}
 
