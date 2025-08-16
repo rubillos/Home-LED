@@ -16,16 +16,38 @@
 
 //--------------------------------------------------------------------
 
+constexpr const char* displayName = "PwrCenter-Controller";
+constexpr const char* modelName = "PwrCenter-Controller-ESP32-S3";
+constexpr const char* versionString = "v1.0";
+
+//--------------------------------------------------------------------
+
 constexpr uint8_t statusStripPin = 33;
 constexpr uint8_t statusStripLength = 4;
+
+#define STATUS_STRIP_COLOR_ORDER "RGB"
+#define STATUS_STRIP_TIMING 0.35, 0.8, 0.7, 0.6, 80.0
+
+//--------------------------------------------------------------------
 
 constexpr uint8_t indicatorDataPin = RGB_DATA;	// 40
 constexpr uint8_t indicatorPowerPin = RGB_PWR;	// 39
 
-constexpr uint8_t ambientLightPin = 4;
+#define INDICATOR_COLOR_ORDER "GRB"
 
 //--------------------------------------------------------------------
-// Pins
+
+constexpr uint8_t ambientLightPin = 4;
+constexpr uint16_t ambientLightReadCount = 3;
+
+//--------------------------------------------------------------------
+
+constexpr uint16_t analogReadStableCount = 5;
+constexpr uint16_t analogReadCountLimit = 30;
+constexpr uint16_t analogReadMaxVariation = 50;
+
+//--------------------------------------------------------------------
+// Breaker Pins
 
 constexpr uint8_t pinServoWasher = MOSI; // 35
 constexpr uint8_t pinServoDryer = SCK;	//36
@@ -55,23 +77,31 @@ constexpr uint8_t statusIndexConverter = 3;
 //--------------------------------------------------------------------
 constexpr uint16_t ADC_Max = 4095;     // This is the default ADC max value on the ESP32 (12 bit ADC width);
 
-constexpr uint16_t adcOnLevel = 2400; // ADC value above which the breaker is considered ON
-constexpr uint16_t adcOffLevel = 2200; // ADC value above which the breaker is considered OFF
+constexpr uint16_t adcInitialOnLevel = 2400; // ADC value above which the breaker is considered ON
+constexpr uint16_t adcInitialOffLevel = 2200; // ADC value above which the breaker is considered OFF
+
+constexpr uint16_t hysterisisRange = 100; // ADC value range for hysterisis to avoid flickering
+
+constexpr uint16_t tripUpperPercentage = 80;
+constexpr uint16_t tripLowerPercentage = 20;
 
 constexpr uint16_t servoMinUSec = 500;
 constexpr uint16_t servoMaxUSec = 2500;
 
-constexpr double servoDisable = NAN;
-constexpr double servoMinAngle = -90;
-constexpr double servoMaxAngle = 90;
+constexpr int16_t servoDisable = 10000;
+constexpr int16_t servoMinAngle = -90;
+constexpr int16_t servoMaxAngle = 90;
 
-constexpr int servoCenterAngle = 0;
+constexpr int16_t servoInitialMoveAngle = 5;
 
 constexpr uint32_t servoPushTimeMS = 250;
+constexpr uint32_t servoResetTimeMS = 100;
 
 constexpr uint32_t senseChangeTimeMS = servoPushTimeMS + 50;
-constexpr uint32_t breakerDelayTimeMS = servoPushTimeMS + 100;
+constexpr uint32_t breakerDelayTimeMS = servoPushTimeMS + 300;
 constexpr uint32_t buddyDelayTimeMS = 0;
+
+constexpr uint32_t trippedStableDurationMS = 300;
 
 constexpr uint8_t ledDarkBrightness = 10;
 constexpr uint8_t ledBrightBrightness = 100;
@@ -82,19 +112,13 @@ constexpr uint8_t statusStripBrightBrightness = 20;
 constexpr uint16_t darkLowThreshold = 700;
 constexpr uint16_t darkHighThreshold = 1000;
 
-constexpr uint32_t lightCheckRateMS = 1000;
+constexpr uint32_t lightCheckRateMS = 300;
 
 constexpr uint32_t statusUpdateRateMS = 1000;
 
 //--------------------------------------------------------------------
 
-constexpr const char* displayName = "PwrCenter-Controller";
-constexpr const char* modelName = "PwrCenter-Controller-ESP32-S3";
-constexpr const char* versionString = "v1.0";
-
-//--------------------------------------------------------------------
-
-Pixel2 indicator(indicatorDataPin, "GRB");
+Pixel2 indicator(indicatorDataPin, INDICATOR_COLOR_ORDER);
 uint8_t pixelBrightness = 32;
 
 //--------------------------------------------------------------------
@@ -102,10 +126,6 @@ uint8_t pixelBrightness = 32;
 Preferences preferences;
 
 const char* prefsPartitionName = "PwrPrefs";
-const char* movePrefName = "moveAngle";
-
-constexpr int16_t initialServoMoveAngle = 20;
-int16_t servoMoveAngle = initialServoMoveAngle;
 
 //--------------------------------------------------------------------
 
@@ -137,10 +157,38 @@ uint64_t millis64() {
 
 //--------------------------------------------------------------------
 
-uint16_t analogReadClean(uint8_t pin) {
-	analogRead(pin);
-	analogRead(pin);
-	return analogRead(pin);
+uint16_t analogReadClean(uint8_t pin, uint16_t stableReads = analogReadStableCount) {
+	uint16_t stableCount = 0, readCount = 0, maxStableCount = 0;
+	uint16_t adcValue = 0, minValue = 0, maxValue = 0;
+
+	while (stableCount < stableReads && readCount < analogReadCountLimit) {
+		adcValue = analogRead(pin);
+		readCount++;
+
+		if (stableCount == 0) {
+			minValue = adcValue;
+			maxValue = adcValue;
+			stableCount++;
+		}
+		else {
+			minValue = min(minValue, adcValue);
+			maxValue = max(maxValue, adcValue);
+
+			if (maxValue - minValue > analogReadMaxVariation) {
+				stableCount = 0;
+			}
+			else {
+				stableCount++;
+			}
+		}
+		maxStableCount = max(maxStableCount, stableCount);
+	}
+
+	if (readCount == analogReadCountLimit) {
+		SerPrintf("Hit analogRead limit! Longest stable run: %d, diff=%d\n", maxStableCount, maxValue - minValue);
+	}
+
+	return adcValue;
 }
 
 //--------------------------------------------------------------------
@@ -148,19 +196,6 @@ uint16_t analogReadClean(uint8_t pin) {
 void enablePower() {
 	pinMode(indicatorPowerPin, OUTPUT);
 	digitalWrite(indicatorPowerPin, HIGH);
-}
-
-//--------------------------------------------------------------------
-
-void printAndBackUp(const char* fmt, ...) {
-	va_list args;
-	va_start(args, fmt);
-	size_t n = SerPrintf(fmt, args);
-	va_end(args);
-
-	for (auto _=0; _< n; _++) {
-		Serial.print('\b');
-	}
 }
 
 //--------------------------------------------------------------------
@@ -183,14 +218,29 @@ void setIndicator(uint32_t color) {
 }
 
 //--------------------------------------------------------------------
+
+void printAndBackUp(const char* fmt, ...) {
+	va_list args;
+	va_start(args, fmt);
+ 	size_t n = Serial.vprintf(fmt, args);
+	va_end(args);
+
+	for (auto _=0; _< n; _++) {
+		Serial.print('\b');
+	}
+}
+
+//--------------------------------------------------------------------
 bool waitForY() {
 	while (true) {
 		if (Serial.available()) {
 			char c = Serial.read();
 			if (c == 'Y' || c == 'y') {
+				Serial.print('\b');
 				return true;
 			}
-			else if (c == 'N' || c == 'n') {
+			else {
+				Serial.print('\n');
 				return false;
 			}
 		}
@@ -208,53 +258,66 @@ typedef enum {
 struct StatusStrip {
 	Pixel2 *_strip = NULL;
 	uint16_t _length;
-	uint8_t _brightness = 255;
+	bool _reversed;
+	bool _dark;
 	BreakerState_t* _status = NULL;
 	Pixel::Color* _colors = NULL;
 
-	void setBrightness(uint8_t brightness, bool show = true) {
-		if (brightness != _brightness) {
-			_brightness = brightness;
+	inline uint8_t brightness() {
+		return _dark ? statusStripDarkBrightness : statusStripBrightBrightness;
+	}
+
+	void setDark(bool dark, bool show = true) {
+		if (dark != _dark) {
+			_dark = dark;
 			if (show) {
 				showPixels();
 			}
 		}
 	}
 
-	Pixel::Color colorWithBrightness(uint8_t red, uint8_t green, uint8_t blue) {
-		return Pixel::RGB(mul8x8(red, _brightness), mul8x8(green, _brightness), mul8x8(blue, _brightness));
+	Pixel::Color colorRGB(uint8_t red, uint8_t green, uint8_t blue) {
+		uint8_t bright = brightness();
+		return Pixel::RGB(mul8x8(red, bright), mul8x8(green, bright), mul8x8(blue, bright));
 	}
 
 	Pixel::Color colorForState(BreakerState_t state) {
 		switch (state) {
-			case breakerStateOff: 		return colorWithBrightness(255, 0, 0); 		// offColor
-			case breakerStateOn: 		return colorWithBrightness(0, 255, 0); 		// onColor
-			case breakerStateTripped: 	return colorWithBrightness(255, 255, 0); 	// trippedColor
-			default: 					return colorWithBrightness(0, 0, 0); 		// blackColor
+			case breakerStateOff: 		return colorRGB(255, 0, 0); 		// offColor
+			case breakerStateOn: 		return colorRGB(0, 255, 0); 		// onColor
+			case breakerStateTripped: 	return colorRGB(255, 255, 0); 	// trippedColor
+			default: 					return colorRGB(0, 0, 0); 		// blackColor
 		}
 	}
 
 	void showPixels() {
-		if (_strip == NULL || _status == NULL || _colors == NULL) {
-			return;
-		}
+		if (_strip == NULL || _status == NULL || _colors == NULL) return;
 
-		for (int i = 0; i < _length; i++) {
+		for (auto i = 0; i < _length; i++) {
 			_colors[i] = colorForState(_status[i]);
 		}
 		_strip->set(_colors, _length);
 	}
 
 	void setPixel(uint8_t index, BreakerState_t state, bool show = true) {
-		if (index < _length && state != _status[_length - 1 - index]) {
-			_status[_length - 1 - index] = state;
-			if (show) {
-				showPixels();
+		if (_status == NULL) return;
+		
+		if (index < _length) {
+			if (_reversed) {
+				index = _length - 1 - index;
+			}
+			if (state != _status[index]) {
+				_status[index] = state;
+				if (show) {
+					showPixels();
+				}
 			}
 		}
 	}
 
 	void clear(bool show = true) {
+		if (_status == NULL) return;
+
 		for (auto i = 0; i < _length; i++) {
 			_status[i] = breakerStateUnknown;
 		}
@@ -263,11 +326,19 @@ struct StatusStrip {
 		}
 	}
 
-	void begin(uint8_t pin, uint16_t length) {
-		_brightness = 255;
+	void blank() {
+		if (_strip == NULL) return;
+
+		Pixel::Color blankColor = Pixel::RGB(0, 0, 0);
+		_strip->set(blankColor, _length);
+	}
+
+	void begin(uint8_t pin, uint16_t length, bool reversed) {
+		_dark = true;
+		_reversed = reversed;
 		_length = length;
-		_strip = new Pixel2(pin, "RGB");
-		_strip->setTiming(0.35, 0.8, 0.7, 0.6, 80.0);
+		_strip = new Pixel2(pin, STATUS_STRIP_COLOR_ORDER);
+		_strip->setTiming(STATUS_STRIP_TIMING);
 		_status = new BreakerState_t[_length];
 		_colors = new Pixel::Color[_length];
 		for (auto i=0; i<_length; i++) {
@@ -283,24 +354,38 @@ constexpr int trippedSensorTrue = Characteristic::ContactSensorState::DETECTED;
 constexpr int trippedSensorFalse = Characteristic::ContactSensorState::NOT_DETECTED;
 
 struct BreakerController : Service::Outlet {
+	const char* _name;
+
 	SpanCharacteristic* _power;
 	SpanCharacteristic* _tripped;
 
+	int _pinButton;
+
 	ServoPin* _servo = NULL;
-	double _servoAngle = servoDisable;
-	double _angleOffset = 0;
+	int _pinServo;
+	int16_t _servoAngle = servoDisable;
+	int16_t _centerAngle = 0;
+	int16_t _upAngle = servoInitialMoveAngle;
+	int16_t _downAngle = -servoInitialMoveAngle;
 
 	BreakerController* _buddyBreaker = NULL;
+
 	StatusStrip* _statusStrip = NULL;
+	int _statusIndex;
 
 	uint8_t _pinSense;
 	uint16_t _senseOffLevel;
 	uint16_t _senseOnLevel;
-	int _statusIndex;
+	int16_t _senseHysterisisValue = -1;
+	bool _lastTripped = false;
+	uint64_t _lastTrippedTime = 0;
 
 	LedPin* _led = NULL;
+	int _pinLED;
 	int _ledState = -1;
 	bool _dark = false;
+
+	bool _breakerOn;
 
 	int _changeToValue = -1;
 
@@ -310,68 +395,110 @@ struct BreakerController : Service::Outlet {
 	uint64_t _servoMoveTime = 0;
 	uint64_t _senseHoldTime = 0;
 
-	bool _breakerOn;
-
-	String _anglePrefName;
+	String _centerPrefName;
+	String _upPrefName;
+	String _downPrefName;
 	String _onPrefName;
 	String _offPrefName;
+	String _trippedName;
 
-	BreakerController(int servoPin, bool reverseServo, int pinButton, int pinSense, int ledPin, StatusStrip* statusStrip, int statusIndex) : Service::Outlet(){
+	BreakerController(int pinServo, bool reverseServo, int pinButton, int pinSense, int pinLED, StatusStrip* statusStrip, int statusIndex, const char* name) : Service::Outlet(){
+		_name = name;
 
 		new Characteristic::OutletInUse(true);
+
+		_pinButton = pinButton;
+		new SpanButton(pinButton, 1000, 5, 0, SpanButton::TRIGGER_ON_LOW);
+
+		_pinServo = pinServo;
+		_servo = new ServoPin(pinServo, NAN, servoMinUSec, servoMaxUSec, reverseServo ? servoMinAngle : servoMaxAngle, reverseServo ? servoMaxAngle : servoMinAngle);
+
+		_pinLED = pinLED;
+		_led = new LedPin(pinLED, 0);
+
+		_statusStrip = statusStrip;
+		_statusIndex = statusIndex;
+
+		String indexString = String(_statusIndex);
+		_centerPrefName = String("angCent") + indexString;
+		_upPrefName = String("angUp") + indexString;
+		_downPrefName = String("angDown") + indexString;
+		_onPrefName = String("on") + indexString;
+		_offPrefName = String("off") + indexString;
+
+		_centerAngle = preferences.getInt(_centerPrefName.c_str(), 0);
+		_upAngle = preferences.getInt(_upPrefName.c_str(), servoInitialMoveAngle);
+		_downAngle = preferences.getInt(_downPrefName.c_str(), -servoInitialMoveAngle);
+		_senseOnLevel = preferences.getUInt(_onPrefName.c_str(), adcInitialOnLevel);
+		_senseOffLevel = preferences.getUInt(_offPrefName.c_str(), adcInitialOffLevel);
 
 		_pinSense = pinSense;
 		BreakerState_t state = breakerState();
 		_breakerOn = state == breakerStateOn;
 		_power = new Characteristic::On(_breakerOn);
 
-		new SpanButton(pinButton, 1000, 5, 0, SpanButton::TRIGGER_ON_LOW);
-
-		_servo = new ServoPin(servoPin, servoDisable, servoMinUSec, servoMaxUSec, reverseServo ? servoMinAngle : servoMaxAngle, reverseServo ? servoMaxAngle : servoMinAngle);
-		_led = new LedPin(ledPin, 0);
-
-		_statusStrip = statusStrip;
-		_statusIndex = statusIndex;
-
-		String indexString = String(_statusIndex);
-		_anglePrefName = String("aOffset") + indexString;
-		_onPrefName = String("on") + indexString;
-		_offPrefName = String("off") + indexString;
-
-		_angleOffset = preferences.getFloat(_anglePrefName.c_str(), 0.0f);
-		_senseOnLevel = preferences.getUInt(_onPrefName.c_str(), adcOnLevel);
-		_senseOffLevel = preferences.getUInt(_offPrefName.c_str(), adcOffLevel);
-
 		setLED(_breakerOn);
 		setStatus(state);
 
 		new Service::ContactSensor();
 			_tripped = new Characteristic::ContactSensorState(trippedSensorFalse);
+			_trippedName = String(name) + String(" - Tripped");
+			new Characteristic::ConfiguredName(_trippedName.c_str());
 
-		SerPrintf("Breaker %d - servoPin: %d, pinButton: %d, pinSense: %d, ledPin: %d, angleOffset: %.1f, onLevel: %d, offLevel: %d\n",
-						_statusIndex, servoPin, pinButton, _pinSense, ledPin, _angleOffset, _senseOnLevel, _senseOffLevel);
+		#ifdef DEBUG
+		showInfo();
+		#endif
 
 		centerServo();
+	}
+
+	const char* name() {
+		return _name;
+	}
+
+	void showInfo() {
+		Serial.printf("Breaker %d (%s) - pinServo:%d, pinButton:%d, pinSense:%d, pinLED:%d, center:%d, up:%d, down:%d, onLevel:%d, offLevel:%d, hysterisis:%d\n",
+						_statusIndex, _name, _pinServo, _pinButton, _pinSense, _pinLED, _centerAngle, _upAngle, _downAngle, _senseOnLevel, _senseOffLevel, _senseHysterisisValue);
+	}
+
+	void showState() {
+		Serial.printf("Breaker %d (%s) - State: %s%s\n", _statusIndex, _name, _breakerOn ? "On" : "Off", _tripped->getVal()==trippedSensorTrue ? " (TRIPPED!)" : "");
 	}
 
 	void centerServo() {
 		_servoMoveTime = millis64() - servoPushTimeMS;	// trigger setting servo to center position
 	}
 
-	BreakerState_t breakerState(uint16_t* value = NULL) {
+	BreakerState_t breakerState(uint16_t* value = NULL, bool useHysterisis = false) {
 		uint16_t adcVal = analogReadClean(_pinSense);
 
 		if (value) {
 			*value = adcVal;
 		}
+		if (!useHysterisis) {
+			_senseHysterisisValue = -1;
+		}
 
-		if (adcVal >= adcOnLevel) {
+		int senseOn = _senseOnLevel;
+		int senseOff = _senseOffLevel;
+
+		if (_senseHysterisisValue!=-1) {
+			senseOn = min(senseOn + hysterisisRange / 2, max(senseOn, _senseHysterisisValue + hysterisisRange));
+			senseOff = max(senseOff - hysterisisRange / 2, min(senseOff, _senseHysterisisValue - hysterisisRange));
+		}
+
+		if (adcVal >= senseOn) {
+			_senseHysterisisValue = -1;
 			return breakerStateOn;
 		}
-		else if (adcVal <= adcOffLevel) {
+		else if (adcVal <= senseOff) {
+			_senseHysterisisValue = -1;
 			return breakerStateOff;
 		}
 		else {
+			if (useHysterisis) {
+				_senseHysterisisValue = adcVal;
+			}
 			return breakerStateTripped;
 		}
 	}
@@ -398,26 +525,23 @@ struct BreakerController : Service::Outlet {
 		}
 	}
 
-	void setServoAngle(double angle, bool silent = false) {
-		if (!isnan(angle)) {
-			angle += _angleOffset;
-		}
+	void setServoAngle(int16_t angle, bool silent = false) {
 		if (_servo && angle != _servoAngle) {
 			if (!silent) {
-				if (isnan(angle)) {
-					SerPrintf("%6lld: Breaker %d - servo disabled\n", millis64(), _statusIndex);
+				if (angle == servoDisable) {
+					SerPrintf("%6lld: Breaker %d (%s) - servo disabled\n", millis64(), _statusIndex, _name);
 				}
 				else {
-					SerPrintf("%6lld: Breaker %d - set servo to %dº\n", millis64(), _statusIndex, (int)angle);
+					SerPrintf("%6lld: Breaker %d (%s) - set servo to %dº\n", millis64(), _statusIndex, _name, angle);
 				}
 			}
 			_servoAngle = angle;
-			_servo->set(angle);
+			_servo->set(angle == servoDisable ? NAN : angle);
 		}
 	}
-	
-	double getServoAngle() {
-		return isnan(_servoAngle) ? servoDisable : _servoAngle - _angleOffset;
+
+	int16_t getServoAngle() {
+		return _servoAngle;
 	}
 
 	bool update() {
@@ -425,6 +549,7 @@ struct BreakerController : Service::Outlet {
 			bool newPower = _power->getNewVal();
 
 			if (newPower != power()) {
+				SerPrintf("%6lld: Breaker %d (%s) - HomeKit set power to %s\n", millis64(), _statusIndex, _name, newPower ? "ON" : "OFF");
 				_changeToValue = newPower;
 			}	
 		}	
@@ -434,7 +559,8 @@ struct BreakerController : Service::Outlet {
 	void loop() {
 		uint64_t curTime = millis64();
 		uint16_t adcVal = 0;
-		BreakerState_t state = breakerState(&adcVal);
+		bool senseAllowed = curTime >= _senseHoldTime;
+		BreakerState_t state = breakerState(&adcVal, senseAllowed);
 		bool curOnState = state == breakerStateOn;
 
 		if (_servoMoveTime > 0) {
@@ -443,13 +569,13 @@ struct BreakerController : Service::Outlet {
 				_servoMoveTime = 0;
 			}
 			else if (curTime > _servoMoveTime + servoPushTimeMS) {
-				if (getServoAngle() != servoCenterAngle) {
-					setServoAngle(servoCenterAngle);
+				if (getServoAngle() != _centerAngle) {
+					setServoAngle(_centerAngle);
 				}
 			}
-			else if (curTime > _servoMoveTime - servoPushTimeMS) {
-				if (_breakerOn && getServoAngle() != servoMoveAngle) {
-					setServoAngle(servoMoveAngle);
+			else if (curTime > _servoMoveTime - servoResetTimeMS) {
+				if (_breakerOn && getServoAngle() != _upAngle) {
+					setServoAngle(_upAngle);
 				}
 			}
 		}
@@ -457,11 +583,11 @@ struct BreakerController : Service::Outlet {
 			if (_changeToValue != _breakerOn) {
 				_breakerOn = _changeToValue;
 				if (state == breakerStateTripped) {
-					setServoAngle(-servoMoveAngle);
-					_servoMoveTime = curTime + servoPushTimeMS * 2;
+					setServoAngle(_downAngle);
+					_servoMoveTime = curTime + servoPushTimeMS + servoResetTimeMS;
 				}
 				else {
-					setServoAngle(_changeToValue ? servoMoveAngle : -servoMoveAngle);
+					setServoAngle(_changeToValue ? _upAngle : _downAngle);
 					_servoMoveTime = curTime;
 				}
 				_senseHoldTime = _servoMoveTime + senseChangeTimeMS;
@@ -475,16 +601,22 @@ struct BreakerController : Service::Outlet {
 				_delayedChangeTo = -1;
 			}
 		}
-		else if (curTime > _senseHoldTime) {
-			int tripped = (state == breakerStateTripped) ? trippedSensorTrue : trippedSensorFalse;
+		else if (senseAllowed) {
+			bool tripped = state == breakerStateTripped;
+			int trippedValue = tripped ? trippedSensorTrue : trippedSensorFalse;
 
-			if (tripped != _tripped->getVal()) {
-				_tripped->setVal(tripped);
-				SerPrintf("%6lld: Breaker %d - tripped state changed to %s\n", curTime, _statusIndex, tripped == trippedSensorTrue ? "TRIPPED" : "NOT TRIPPED");
+			if (tripped != _lastTripped) {
+				_lastTripped = tripped;
+				_lastTrippedTime = curTime;
+			}
+
+			if (curTime > _lastTrippedTime + trippedStableDurationMS && trippedValue != _tripped->getVal()) {
+				_tripped->setVal(trippedValue);
+				SerPrintf("%6lld: Breaker %d (%s) - tripped state changed to %s - (adc=%d of %d-%d)\n", curTime, _statusIndex, _name, trippedValue == trippedSensorTrue ? "TRIPPED" : "NOT TRIPPED", adcVal, _senseOffLevel, _senseOnLevel);
 			}
 			
 			if (curOnState != _power->getVal()) {
-				SerPrintf("%6lld: Breaker %d - state mismatch, setting to %d (state=%d, adc=%d, on=%d, off=%d)\n", curTime, _statusIndex, curOnState, state, adcVal, _senseOnLevel, _senseOffLevel);
+				SerPrintf("%6lld: Breaker %d (%s) - state mismatch, setting to %d (state=%d, adc=%d of %d-%d)\n", curTime, _statusIndex, _name, curOnState, state, adcVal, _senseOffLevel, _senseOnLevel);
 				_breakerOn = curOnState;
 				_power->setVal(curOnState);
 			}
@@ -496,7 +628,7 @@ struct BreakerController : Service::Outlet {
 
 	void setPower(bool value, uint32_t afterDelayMS = 0) {
 		if (value != power()) {
-			SerPrintf("%6lld: Breaker %d - setPower to %d\n", millis64(), _statusIndex, value);
+			SerPrintf("%6lld: Breaker %d (%s) - setPower to %d\n", millis64(), _statusIndex, _name, value);
 			if (_delayedChangeTo != -1) {
 				_delayedChangeTo = -1;
 			}
@@ -521,109 +653,130 @@ struct BreakerController : Service::Outlet {
 
 	void button(int pin, int pressType) override {
 		if (pressType == SpanButton::SINGLE) {
-			SerPrintf("%6lld: Breaker %d - Button Press - toggle power\n", millis64(), _statusIndex);
+			SerPrintf("%6lld: Breaker %d (%s) - Button Press - toggle power\n", millis64(), _statusIndex, _name);
 			setPower(!power());
 		}
 		else if (_buddyBreaker && pressType == SpanButton::LONG) {
 			bool newState = !power();
 
-			SerPrintf("%6lld: Breaker %d - Button Long Press - toggle power, local and buddy\n", millis64(), _statusIndex);
+			SerPrintf("%6lld: Breaker %d (%s) - Button Long Press - toggle power, local and buddy\n", millis64(), _statusIndex, _name);
 			setPower(newState);
 			_buddyBreaker->setPower(newState, buddyDelayTimeMS);
 		}
 	}
 
-	void calibrateCenter() {
+	bool adjustAngles() {
+		bool result = false;
+
 		if (_servo) {
+			int16_t *values[3] = { &_centerAngle, &_upAngle, &_downAngle };
+			constexpr const char* names[3] = { "CENTER", "UP    ", "DOWN  " };
+			constexpr uint16_t indexes[] = { 0, 1, 0, 2 };	// center, up, center, down
+			constexpr uint16_t numIndexes = sizeof(indexes) / sizeof(*indexes);
+			uint16_t curIndex = 0;
 			bool changed = false;
-			bool moved = true;
+			bool update = true;
 			bool done = false;
 
-			setServoAngle(servoCenterAngle, true);
-
-			SerPrintf("%6lld: Breaker %d - calibrate center\n", millis64(), _statusIndex);
-			SerPrintf("Press 'u' for up and 'd' for down to adjust\n");
-			SerPrintf("Press <return> to save, press <esc> to exit\n");
+			Serial.printf("\n%6lld: Breaker %d (%s) - Calibrate angles\n", millis64(), _statusIndex, _name);
+			Serial.printf("To adjust press 'u' for up and 'd' for down\n");
+			Serial.printf("Press <space> to select center angle, up angle, or down angle\n");
+			Serial.printf("Press <return> to save, press <esc> to exit\n");
 			while (!done) {
-				if (moved) {
-					printAndBackUp("Current angle offset: % 4dº", (int)_angleOffset);
-					moved = false;
+				if (update) {
+					printAndBackUp("%6lld: Current %s angle: % 3dº", millis64(), names[indexes[curIndex]], *values[indexes[curIndex]]);
+					setServoAngle(*values[indexes[curIndex]], true);
+					update = false;
 				}
 				if (Serial.available()) {
 					char c = Serial.read();
 					if (c == '\n' || c == '\r') {
-						Serial.print("\n");
+						Serial.printf("\n");
 						done = true;
+						result = true;
 					}
 					else if (c == 27) { // ESC
-						SerPrintf("\n\nCalibration cancelled.\n");
+						Serial.printf("\n\nCalibration cancelled.\n");
 						done = true;
 						changed = false;
 					}
 					else if (c == 'u' || c == 'U') { // up
 						Serial.print('\b');
-						_angleOffset += 1.0;
-						moved = true;
+						*values[indexes[curIndex]] += 1;
+						changed = true;
+						update = true;
 					}
 					else if (c == 'd' || c == 'D') { // down
 						Serial.print('\b');
-						_angleOffset -= 1.0;
-						moved = true;
+						*values[indexes[curIndex]] -= 1;
+						changed = true;
+						update = true;
 					}
-				}
-				if (moved) {
-					setServoAngle(servoCenterAngle, true);
-					changed = true;
+					else if (c == ' ') { // space
+						Serial.print('\b');
+						curIndex = (curIndex + 1) % numIndexes;
+						update = true;
+					}
 				}
 			}
 			if (changed) {
-				SerPrintf("\nCalibration complete. Saving new center angle: %2dº\n", (int)_angleOffset);
-				preferences.putFloat(_anglePrefName.c_str(), _angleOffset);
+				Serial.printf("\nCalibration complete. Saving new angles: center=%dº, up=%dº, down=%dº\n", _centerAngle, _upAngle, _downAngle);
+				preferences.putInt(_centerPrefName.c_str(), _centerAngle);
+				preferences.putInt(_upPrefName.c_str(), _upAngle);
+				preferences.putInt(_downPrefName.c_str(), _downAngle);
 			}
 			else {
-				SerPrintf("\nNo changes made to center angle.\n");
+				Serial.printf("\nNo changes made to center angle.\n");
 			}
 
-			setServoAngle(servoDisable, true);
+			centerServo();
 		}
+		return result;
 	}
 
-	void calibrateSenseLevels() {
-		SerPrintf("%6lld: Breaker %d - calibrate sense levels\n", millis64(), _statusIndex);
-		SerPrintf("Measuring On... %d\n", _senseOnLevel);
+	bool calibrateSenseLevels() {
+		bool result = false;
 
-		uint16_t onValue, offValue;
+		if (_servo) {
+			Serial.printf("\n%6lld: Breaker %d (%s) - Calibrate sense levels\n", millis64(), _statusIndex, _name);
+			Serial.printf("Measuring On... %d\n", _senseOnLevel);
 
-		setServoAngle(servoMoveAngle, true);
-		delay(senseChangeTimeMS);
-		breakerState(&onValue);
+			uint16_t onValue, offValue;
 
-		SerPrintf("Measuring Off... %d\n", _senseOffLevel);
+			setServoAngle(_upAngle, true);
+			delay(senseChangeTimeMS);
+			breakerState(&onValue);
 
-		setServoAngle(-servoMoveAngle, true);
-		delay(senseChangeTimeMS);
-		breakerState(&offValue);
+			Serial.printf("Measuring Off... %d\n", _senseOffLevel);
 
-		setServoAngle(servoCenterAngle, true);
-		delay(servoPushTimeMS);
+			setServoAngle(_downAngle, true);
+			delay(senseChangeTimeMS);
+			breakerState(&offValue);
 
-		uint16_t newOnLevel = offValue + (onValue - offValue) * 3 / 4;
-		uint16_t newOffLevel = offValue + (onValue - offValue) / 2;
+			setServoAngle(_centerAngle, true);
+			delay(servoPushTimeMS);
 
-		SerPrintf("\nNew On Level: %d, New Off Level: %d (on=%d, off=%d)\n", newOnLevel, newOffLevel, onValue, offValue);
-		SerPrintf("Press 'Y' to accept these new levels, or any other key to reject.\n");
+			uint16_t newOnLevel = offValue + (onValue - offValue) * tripUpperPercentage / 100;
+			uint16_t newOffLevel = offValue + (onValue - offValue) * tripLowerPercentage / 100;
 
-		if (waitForY()) {
-			_senseOnLevel = newOnLevel;
-			_senseOffLevel = newOffLevel;
-			preferences.putUInt(_onPrefName.c_str(), _senseOnLevel);
-			preferences.putUInt(_offPrefName.c_str(), _senseOffLevel);
-			SerPrintf("\nNew sense levels ACCEPTED.\n");
+			Serial.printf("\nNew On Level: %d, New Off Level: %d (on=%d, off=%d)\n", newOnLevel, newOffLevel, onValue, offValue);
+			Serial.printf("Press 'Y' to accept these new levels, or any other key to reject.\n");
+
+			if (waitForY()) {
+				_senseOnLevel = newOnLevel;
+				_senseOffLevel = newOffLevel;
+				preferences.putUInt(_onPrefName.c_str(), _senseOnLevel);
+				preferences.putUInt(_offPrefName.c_str(), _senseOffLevel);
+				result = true;
+				Serial.printf("\nNew sense levels ACCEPTED.\n");
+			}
+			else {
+				Serial.printf("\nNew sense levels REJECTED.\n");
+			}
+
+			centerServo();
 		}
-		else {
-			SerPrintf("\nNew sense levels REJECTED.\n");
-		}
-		centerServo();
+		return result;
 	}
 };
 
@@ -657,7 +810,7 @@ struct PowerLevel : Service::LightBulb {
 
 	void activate() {
 		if (_amps != currentAmps()) {
-			SerPrintf("PowerLevel: Activate - %dA\n", _amps);
+			SerPrintf("\n%6lld: PowerLevel: Activate - %dA\n", millis64(), _amps);
 
 			bool invPower = inverter->power();
 			bool convPower = converter->power();
@@ -693,89 +846,24 @@ struct PowerLevel : Service::LightBulb {
 	}
 };
 
-void calibrateUpDown(BreakerController* breaker) {
-	bool changed = false;
-	bool moved = true;
-	bool done = false;
-	bool up = true;
-
-	breaker->setServoAngle(up ? servoMoveAngle : -servoMoveAngle, true);
-
-	SerPrintf("%6lld: Breaker %d - calibrate up/down angle\n", millis64(), breaker->_statusIndex);
-	SerPrintf("Press 'u' for up and 'd' for down to adjust\n");
-	SerPrintf("Press <space> to toggle direction\n");
-	SerPrintf("Press <return> to save, press <esc> to exit\n");
-	while (!done) {
-		bool update = false;
-		if (moved) {
-			printAndBackUp("Current up/down angle: % 2dº", servoMoveAngle);
-			moved = false;
-		}
-		if (Serial.available()) {
-			char c = Serial.read();
-			if (c == '\n' || c == '\r') {
-				Serial.print("\n");
-				done = true;
-			}
-			else if (c == 27) { // ESC
-				SerPrintf("\n\nCalibration cancelled.\n");
-				done = true;
-				changed = false;
-			}
-			else if (c == 'u' || c == 'U') { // up
-				Serial.print('\b');
-				servoMoveAngle += 1.0;
-				moved = true;
-			}
-			else if (c == 'd' || c == 'D') { // down
-				Serial.print('\b');
-				servoMoveAngle -= 1.0;
-				moved = true;
-			}
-			else if (c == ' ') { // space
-				up = !up;
-				Serial.print('\b');
-				update = true;
-			}
-		}
-		if (moved) {
-			changed = true;
-		}
-		if (update || moved) {
-			breaker->setServoAngle(up ? servoMoveAngle : -servoMoveAngle, true);
-		}
-	}
-	if (changed) {
-		SerPrintf("Calibration complete. Saving new up/down angle: %dº\n", servoMoveAngle);
-		preferences.putFloat(movePrefName, servoMoveAngle);
-	}
-	else {
-		SerPrintf("No changes made to up/down angle.\n");
-	}
-
-	breaker->centerServo();
-}
-
 //--------------------------------------------------------------------
 
 PowerLevel* fullPower;
 PowerLevel* reducedPower;
 PowerLevel* minimumPower;
 
+BreakerController* SPAN_BREAKER(const char* name, int pinServo, bool reverse, int pinButton, int pinSense, int pinLed, int statusIndex) {
+	SPAN_ACCESSORY(name);
+	return new BreakerController(pinServo, reverse, pinButton, pinSense, pinLed, &statusStrip, statusIndex, name);
+}
+
 void createDevices() {
 	SPAN_ACCESSORY();   // create Bridge
 
-		SPAN_ACCESSORY("Washer");
-			washer = new BreakerController(pinServoWasher, true, pinButtonWasher, pinSenseWasher, pinLedWasher, &statusStrip, statusIndexWasher);
-
-		SPAN_ACCESSORY("Dryer");
-			dryer = new BreakerController(pinServoDryer, true, pinButtonDryer, pinSenseDryer, pinLedDryer, &statusStrip, statusIndexDryer);
-
-		SPAN_ACCESSORY("Inverter");
-			inverter = new BreakerController(pinServoInverter, true, pinButtonInverter, pinSenseInverter, pinLedInverter, &statusStrip, statusIndexInverter);
-
-		SPAN_ACCESSORY("Converter");
-			converter = new BreakerController(pinServoConverter, false, pinButtonConverter, pinSenseConverter, pinLedConverter, &statusStrip, statusIndexConverter);
+		washer = SPAN_BREAKER("Washer", pinServoWasher, true, pinButtonWasher, pinSenseWasher, pinLedWasher, statusIndexWasher);
+		dryer = SPAN_BREAKER("Dryer", pinServoDryer, true, pinButtonDryer, pinSenseDryer, pinLedDryer, statusIndexDryer);
+		inverter = SPAN_BREAKER("Inverter", pinServoInverter, true, pinButtonInverter, pinSenseInverter, pinLedInverter, statusIndexInverter);
+		converter = SPAN_BREAKER("Converter", pinServoConverter, false, pinButtonConverter, pinSenseConverter, pinLedConverter, statusIndexConverter);
 
 		washer->setBuddy(dryer);
 		dryer->setBuddy(washer);
@@ -797,23 +885,16 @@ BreakerController* getBreakerFromCmd(const char *buf) {
 		case statusIndexInverter: return inverter;
 		case statusIndexConverter: return converter;
 		default: {
-			SerPrintf("Invalid index, must be 0-3\n");
+			Serial.printf("\n%6lld: Invalid index, must be 0-3\n", millis64());
 			return NULL;
 		}
 	}
 }
 
-void cmdCalibrateCenter(const char *buf){
+void cmdAdjustAngles(const char *buf){
 	BreakerController* breaker = getBreakerFromCmd(buf);
 	if (breaker) {
-		breaker->calibrateCenter();
-	}
-}
-
-void cmdCalibrateUpDown(const char *buf){
-	BreakerController* breaker = getBreakerFromCmd(buf);
-	if (breaker) {
-		calibrateUpDown(breaker);
+		breaker->adjustAngles();
 	}
 }
 
@@ -828,94 +909,143 @@ void cmdSetBreakerPower(const char *buf){
 	BreakerController* breaker = getBreakerFromCmd(buf);
 	if (breaker) {
 		if (buf[2] == '0') {
-			SerPrintf("Setting Breaker %d to OFF\n", breaker->_statusIndex);
+			Serial.printf("\n%6lld: Setting Breaker %d (%s) to OFF\n", millis64(), breaker->_statusIndex, breaker->_name);
 			breaker->setPower(false);
 		}
 		else if (buf[2] == '1') {
-			SerPrintf("Setting Breaker %d to ON\n", breaker->_statusIndex);
+			Serial.printf("\n%6lld: Setting Breaker %d (%s) to ON\n", millis64(), breaker->_statusIndex, breaker->_name);
 			breaker->setPower(true);
 		}
 		else {
-			SerPrintf("Invalid command, must be 2 digits, 0-3 followed by 0 or 1\n");
+			Serial.printf("\n%6lld: Invalid command, must be 2 digits, 0-3 followed by 0 or 1\n", millis64());
 		}
 	}
 }
 
-void cmdSetPowerLevel(const char *buf){
-	if (strcasecmp(buf+1, "min") == 0) {
-		SerPrintf("Setting power level to MINIMUM\n");
+void cmdShowInfo(const char *buf){
+	if (buf[1] == 0) {
+		washer->showInfo();
+		dryer->showInfo();
+		inverter->showInfo();
+		converter->showInfo();
+	}
+	else {
+		BreakerController* breaker = getBreakerFromCmd(buf);
+		if (breaker) {
+			breaker->showInfo();
+		}
+	}
+}
+
+void cmdShowState(const char *buf){
+	if (buf[1] == 0) {
+		washer->showState();
+		dryer->showState();
+		inverter->showState();
+		converter->showState();
+	}
+	else {
+		BreakerController* breaker = getBreakerFromCmd(buf);
+		if (breaker) {
+			breaker->showState();
+		}
+	}
+}
+
+bool strMatchAny(const char* str1, ...) {
+	va_list args;
+	va_start(args, str1);
+	const char* str2;
+	while ((str2 = va_arg(args, const char*)) != NULL) {
+		if (strcasecmp(str1, str2) == 0) {
+			va_end(args);
+			return true;
+		}
+	}
+	va_end(args);
+	return false;
+}
+
+void cmdPowerLevel(const char *buf){
+	buf++;
+	if (buf[0] == 0) {
+		Serial.printf("\n%6lld: Current power level: %dA\n", millis64(), fullPower->currentAmps());
+	}
+	else if (strMatchAny(buf, "15", "min", "minimum")) {
+		Serial.printf("\n%6lld: Setting power level to MINIMUM (15A)\n", millis64());
 		minimumPower->activate();
 	}
-	else if (strcasecmp(buf+1, "low") == 0) {
-		SerPrintf("Setting power level to LOW\n");
+	else if (strMatchAny(buf, "20", "low", "reduced")) {
+		Serial.printf("\n%6lld: Setting power level to LOW (20A)\n", millis64());
 		reducedPower->activate();
 	}
-	else if (strcasecmp(buf+1, "full") == 0) {
-		SerPrintf("Setting power level to FULL\n");
+	else if (strMatchAny(buf, "50", "full")) {
+		Serial.printf("\n%6lld: Setting power level to FULL (50A)\n", millis64());
 		fullPower->activate();
 	}
 	else {
-		SerPrintf("Invalid power level. Use 'min', 'low', or 'full'.\n");
+		Serial.printf("\n%6lld: Invalid power level. Use '15/min/minimum', '20/low/reduced', or '50/full'.\n", millis64());
 	}
 }
 
 void cmdClearPreferences(const char *buf) {
-	SerPrintf("%6lld: Clear preferences\n", millis64());
-	SerPrintf("This will remove all saved settings, including breaker angles and sense levels.\n");
-	SerPrintf("Press 'Y' to confirm and restart, or any other key to cancel.\n");
+	Serial.printf("\n%6lld: Clear preferences\n", millis64());
+	Serial.printf("This will remove all saved settings, including breaker angles and sense levels.\n");
+	Serial.printf("Press 'Y' to confirm and restart, or any other key to cancel.\n");
 
 	if (waitForY()) {
 		preferences.clear();
 		preferences.end();
-		SerPrintf("Preferences cleared. Restarting...\n");
+		Serial.printf("\nPreferences cleared. Restarting...\n");
 		ESP.restart();
 	}
 	else {
-		SerPrintf("Clear preferences cancelled.\n");
+		Serial.printf("\nClear preferences cancelled.\n");
 	}
 }
 
 void cmdUpdateAccessories(const char *buf){
 
 	if(homeSpan.updateDatabase()) {
-		SerPrintf("Accessories Database updated.  New configuration number broadcast...\n");
+		Serial.printf("Accessories Database updated.  New configuration number broadcast...\n");
 	}
 	else {
-		SerPrintf("Nothing to update - no changes were made!\n");
+		Serial.printf("Nothing to update - no changes were made!\n");
 	}
 }
 
 void cmdShowCPUStats(const char *buff = nullptr) {
-	SerPrintf("\n*** CPU Stats ***\n\n");
+	Serial.printf("\n%6lld: *** CPU Stats ***\n\n", millis64());
 
-	SerPrintf("CPU frequency: %ldMHz\n", getCpuFrequencyMhz());
-	SerPrintf("Xtal frequency: %ldMHz\n", getXtalFrequencyMhz());
-	SerPrintf("Bus frequency: %ldMHz\n", getApbFrequency()/1000000);
-	SerPrintf("Total heap: %ld\n", ESP.getHeapSize());
-	SerPrintf("Free heap: %ld\n", ESP.getFreeHeap());
-	SerPrintf("Total PSRAM: %ld\n", ESP.getPsramSize());
-	SerPrintf("Free PSRAM: %ld\n", ESP.getFreePsram());
+	Serial.printf("CPU frequency: %ldMHz\n", getCpuFrequencyMhz());
+	Serial.printf("Xtal frequency: %ldMHz\n", getXtalFrequencyMhz());
+	Serial.printf("Bus frequency: %ldMHz\n", getApbFrequency()/1000000);
+	Serial.printf("Total heap: %ld\n", ESP.getHeapSize());
+	Serial.printf("Free heap: %ld\n", ESP.getFreeHeap());
+	Serial.printf("Total PSRAM: %ld\n", ESP.getPsramSize());
+	Serial.printf("Free PSRAM: %ld\n", ESP.getFreePsram());
 
-	SerPrintf("\n*** CPU Stats ***\n\n");
+	Serial.printf("\n*** CPU Stats ***\n\n");
 }
 
 bool adcStatusEnabled = false;
 
 void cmdToggleADCStatus(const char *buf) {
 	adcStatusEnabled = !adcStatusEnabled;
-	SerPrintf("ADC Status: %s\n", adcStatusEnabled ? "ON" : "OFF");
+	Serial.printf("ADC Status: %s\n", adcStatusEnabled ? "ON" : "OFF");
 }
 
 void addCommands() {
 	new SpanUserCommand('s',"show CPU stats", cmdShowCPUStats);
 	new SpanUserCommand('u',"update accessory database", cmdUpdateAccessories);
-	new SpanUserCommand('a',"toggle ADC status", cmdToggleADCStatus);
-	new SpanUserCommand('p',"set breaker N to 0=off, 1=on)", cmdSetBreakerPower);
-	new SpanUserCommand('w',"set power level - 'min', 'low', 'full'", cmdSetPowerLevel);
 	new SpanUserCommand('x',"clear preferences", cmdClearPreferences);
+	new SpanUserCommand('a',"toggle ADC/Ambient value display", cmdToggleADCStatus);
+	new SpanUserCommand('b',"set breaker N to 0=off, 1=on)", cmdSetBreakerPower);
+	new SpanUserCommand('p',"show panel power level, or set panel power level to N amps, or 'min', 'low', 'full'", cmdPowerLevel);
+	new SpanUserCommand('n',"adjust servo angles for breaker N", cmdAdjustAngles);
 	new SpanUserCommand('l',"measure sense levels for breaker N", cmdMeasureSenseLevels);
-	new SpanUserCommand('m',"calibrate servo up/down move for breaker N", cmdCalibrateUpDown);
-	new SpanUserCommand('c',"calibrate servo center for breaker N", cmdCalibrateCenter);
+	new SpanUserCommand('i',"show info for all breakers, or for breaker N", cmdShowInfo);
+	new SpanUserCommand('t',"show state for all breakers, or for breaker N", cmdShowState);
 }
 
 //--------------------------------------------------------------------
@@ -929,28 +1059,25 @@ void flashIndicator(uint32_t color, uint16_t count, uint16_t period) {
 	}
 }
 
+bool wifiConnected = false;
+
 void statusChanged(HS_STATUS status) {
-	if (status == HS_WIFI_CONNECTING) {
+	if (wifiConnected && status == HS_WIFI_CONNECTING) {
+		wifiConnected = false;
 		setIndicator(connectingColor);
-		currentIndicatorColor = connectingColor;
 		SerPrintf("Lost WIFI Connection...\n");
 	}
 }
 
 void wifiReady(int ready) {
+	wifiConnected = true;
 	setIndicator(readyColor);
-	SerPrintf("WIFI: Ready.\n");
-}
-
-TaskHandle_t t;
-
-double mapf(double x, double in_min, double in_max, double out_min, double out_max) {
-	return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+	SerPrintf("WIFI: Connected.\n");
 }
 
 void setup() {
 	enablePower();
-	statusStrip.begin(statusStripPin, statusStripLength);
+	statusStrip.begin(statusStripPin, statusStripLength, true);
 
 	flashIndicator(flashColor, 20, 100);
 	setIndicator(startColor);
@@ -959,7 +1086,7 @@ void setup() {
 	SerPrintf("Power Center Controller Startup\n");
 
 	SerPrintf("Setup status LED strip\n");
-	statusStrip.setBrightness(statusStripBrightBrightness, false);
+	statusStrip.setDark(false, false);
 
 	for (auto i=-1; i<=statusStripLength; i++) {
 		statusStrip.setPixel(i-1, breakerStateUnknown, false);
@@ -969,23 +1096,23 @@ void setup() {
 		delay(100);
 	}
 
+	statusStrip.setDark(true, false);
+
 	SerPrintf("Initialize Preferences\n");
 	preferences.begin(prefsPartitionName, false);
-	servoMoveAngle = preferences.getFloat(movePrefName, initialServoMoveAngle);
-	SerPrintf("Servo move angle: %d\n", servoMoveAngle);
 
 	SerPrintf("Init HomeSpan\n");
 	homeSpan.setSketchVersion(versionString);
 	homeSpan.setConnectionCallback(wifiReady);
 	homeSpan.setStatusCallback(statusChanged);
 	homeSpan.begin(Category::Bridges, displayName, DEFAULT_HOST_NAME, modelName);
+	setIndicator(connectingColor);
 
 	SerPrintf("Create devices\n");
 	createDevices();
-	addCommands();
 
-	SerPrintf("Wait for WiFi...\n");
-	setIndicator(connectingColor);
+	SerPrintf("Add Commands\n");
+	addCommands();
 
 	SerPrintf("Init complete.\n");
 }
@@ -996,13 +1123,13 @@ void checkAmbientLight() {
 
 	if (curTime >= ambientCheckTime) {
 		ambientCheckTime = curTime + lightCheckRateMS;
-		uint16_t ambientLight = analogReadClean(ambientLightPin);
-		// SerPrintf("Ambient Light: %d\n", ambientLight);
+		uint16_t ambientLight = analogReadClean(ambientLightPin, ambientLightReadCount);
+
 		if (ambientLight <= darkLowThreshold) {
-			statusStrip.setBrightness(statusStripDarkBrightness);
+			statusStrip.setDark(true);
 		}
 		else if (ambientLight >= darkHighThreshold) {
-			statusStrip.setBrightness(statusStripBrightBrightness);
+			statusStrip.setDark(false);
 		}
 	}
 }
@@ -1012,6 +1139,7 @@ void showADCStatus() {
 		static uint64_t nextStatusTime = 0;
 
 		uint64_t curTime = millis64();
+
 		if (curTime >= nextStatusTime) {
 			nextStatusTime = curTime + statusUpdateRateMS;
 
@@ -1019,8 +1147,9 @@ void showADCStatus() {
 			uint16_t adcDryer = analogReadClean(pinSenseDryer);
 			uint16_t adcInverter = analogReadClean(pinSenseInverter);
 			uint16_t adcConverter = analogReadClean(pinSenseConverter);
+			uint16_t ambientLight = analogReadClean(ambientLightPin, ambientLightReadCount);
 
-			SerPrintf("%6lld: ADC Washer: %4d, Dryer: %4d, Inverter: %4d, Converter: %4d\n", curTime, adcWasher, adcDryer, adcInverter, adcConverter);
+			Serial.printf("%6lld: ADC Washer: %4d, Dryer: %4d, Inverter: %4d, Converter: %4d - Ambient Light: %4d\n", curTime, adcWasher, adcDryer, adcInverter, adcConverter, ambientLight);
 		}
 	}
 }
