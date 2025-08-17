@@ -30,7 +30,19 @@
 			"*.inc": "cpp",
 			"algorithm": "cpp",
 			"bitset": "cpp",
-			"*.txt": "cpp"
+			"*.txt": "cpp",
+			"bit": "cpp",
+			"compare": "cpp",
+			"set": "cpp",
+			"format": "cpp",
+			"limits": "cpp",
+			"mutex": "cpp",
+			"shared_mutex": "cpp",
+			"sstream": "cpp",
+			"stop_token": "cpp",
+			"streambuf": "cpp",
+			"tuple": "cpp",
+			"variant": "cpp"
 		}
 	}
 }
