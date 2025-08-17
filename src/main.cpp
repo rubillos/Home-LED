@@ -1,9 +1,9 @@
 #include "Arduino.h"
-
-#include "HomeSpan.h" 
 #include <Preferences.h>
-#include "Pixel2.h"
+
 #include "BlinkableLEDPin.h"
+#include "HomeSpan.h"
+#include "Pixel2.h"
 
 //--------------------------------------------------------------------
 
@@ -50,28 +50,28 @@ constexpr uint16_t analogReadMaxVariation = 50;
 //--------------------------------------------------------------------
 // Breaker Pins
 
-constexpr uint8_t pinServoWasher = MOSI; // 35
-constexpr uint8_t pinServoDryer = SCK;	//36
+constexpr uint8_t pinServoWasher = SCK;	//36
+constexpr uint8_t pinServoDryer = MOSI; // 35
 constexpr uint8_t pinServoInverter = 5;
 constexpr uint8_t pinServoConverter = 6;
 
-constexpr uint8_t pinSenseWasher = 17;
-constexpr uint8_t pinSenseDryer = 18;
+constexpr uint8_t pinSenseWasher = 18;
+constexpr uint8_t pinSenseDryer = 17;
 constexpr uint8_t pinSenseInverter = 14;
 constexpr uint8_t pinSenseConverter = 12;
 
-constexpr uint8_t pinLedWasher = SDA;	// 8
-constexpr uint8_t pinLedDryer = TX;	// 43
+constexpr uint8_t pinLedWasher = TX;	// 43
+constexpr uint8_t pinLedDryer = SDA;	// 8
 constexpr uint8_t pinLedInverter = MISO;	// 37
 constexpr uint8_t pinLedConverter = SCL;	// 9
 
-constexpr uint8_t pinButtonWasher = 3;
-constexpr uint8_t pinButtonDryer = 7;
+constexpr uint8_t pinButtonWasher = 7;
+constexpr uint8_t pinButtonDryer = 3;
 constexpr uint8_t pinButtonInverter = 1;
 constexpr uint8_t pinButtonConverter = 38;
 
-constexpr uint8_t statusIndexWasher = 1;
-constexpr uint8_t statusIndexDryer = 0;
+constexpr uint8_t statusIndexWasher = 0;
+constexpr uint8_t statusIndexDryer = 1;
 constexpr uint8_t statusIndexInverter = 2;
 constexpr uint8_t statusIndexConverter = 3;
 
@@ -104,17 +104,24 @@ constexpr uint32_t buddyDelayTimeMS = 0;
 
 constexpr uint32_t trippedStableDurationMS = 300;
 
-constexpr uint8_t ledDarkBrightness = 10;
+constexpr uint8_t ledDarkBrightness = 20;
 constexpr uint8_t ledBrightBrightness = 100;
+
+constexpr uint16_t remoteLEDAmbientLightHigh = 500;
+constexpr uint16_t remoteLEDAmbientLightLow = 200;
 
 constexpr uint16_t ledTrippedRateMS = 500;
 constexpr float ledTrippedPeriod = 0.4;
 
-constexpr uint8_t statusStripDarkBrightness = 1;
-constexpr uint8_t statusStripBrightBrightness = 20;
+constexpr uint8_t statusStripOffBrightness = 0;
+constexpr uint8_t statusStripDarkBrightness = 5;
+constexpr uint8_t statusStripHighBrightness = 30;
 
-constexpr uint16_t darkLowThreshold = 700;
-constexpr uint16_t darkHighThreshold = 1000;
+constexpr uint16_t statusStripOffLowThreshold = 80;
+constexpr uint16_t statusStripOffHighThreshold = 130;
+
+constexpr uint16_t statusStripDarkLowThreshold = 700;
+constexpr uint16_t statusStripDarkHighThreshold = 1000;
 
 constexpr uint32_t lightCheckRateMS = 300;
 
@@ -133,9 +140,9 @@ const char* prefsPartitionName = "PwrPrefs";
 
 //--------------------------------------------------------------------
 
-constexpr uint8_t ledStatusLevel = 0x10;
+constexpr uint8_t ledStatusLevel = 0xFF;
 
-#define MAKE_RGB(r, g, b) (r<<16 | g<<8 | b)
+constexpr uint32_t MAKE_RGB(uint8_t r, uint8_t g, uint8_t b) { return (r)<<16 | (g)<<8 | (b); }
 constexpr uint32_t flashColor = MAKE_RGB(ledStatusLevel, 0, ledStatusLevel);
 constexpr uint32_t startColor = MAKE_RGB(ledStatusLevel, 0, 0);
 constexpr uint32_t connectingColor = MAKE_RGB(0, 0, ledStatusLevel);
@@ -148,12 +155,13 @@ uint32_t currentIndicatorColor = unknownColor;
 //--------------------------------------------------------------------
 
 uint64_t millis64() {
-	volatile static uint32_t low32 = 0, high32 = 0;
+	volatile static uint32_t low32 = 0;
+	volatile static uint32_t high32 = 0;
 	uint32_t new_low32 = millis();
 
-	if (new_low32 < low32)
+	if (new_low32 < low32) {
 		high32++;
-
+	}
 	low32 = new_low32;
 
 	return (uint64_t) high32 << 32 | low32;
@@ -205,19 +213,22 @@ void enablePower() {
 //--------------------------------------------------------------------
 
 inline uint8_t mul8x8(uint8_t a, uint8_t b) { return (a * b) / 255; }
-inline uint8_t pixBright(uint8_t value) {
-	if (value) { return max((uint8_t)1, mul8x8(value, pixelBrightness)); }
+inline uint8_t pixBright(uint8_t value, uint8_t bright) {
+	if (value && bright) { return max((uint8_t)1, mul8x8(value, bright)); }
 	else return 0;
 }
 
-void setIndicatorBrightness(uint8_t brightness) {
-	pixelBrightness = brightness;
+void setIndicator(uint32_t color, bool force = false) {
+	if (color != currentIndicatorColor || force) {
+		currentIndicatorColor = color;
+		indicator.set(Pixel::RGB(pixBright(color>>16, pixelBrightness), pixBright((color>>8) & 0xFF, pixelBrightness), pixBright(color & 0xFF, pixelBrightness)), 1);
+	}
 }
 
-void setIndicator(uint32_t color) {
-	if (color != currentIndicatorColor) {
-		currentIndicatorColor = color;
-		indicator.set(Pixel::RGB(pixBright(color>>16), pixBright((color>>8) & 0xFF), pixBright(color & 0xFF)), 1);
+void setIndicatorBrightness(uint8_t brightness, bool force = false) {
+	if (brightness != pixelBrightness || force) {
+		pixelBrightness = brightness;
+		setIndicator(currentIndicatorColor, true);
 	}
 }
 
@@ -263,26 +274,55 @@ struct StatusStrip {
 	Pixel2 *_strip = NULL;
 	uint16_t _length;
 	bool _reversed;
-	bool _dark;
+	uint8_t _brightness;
 	BreakerState_t* _status = NULL;
 	Pixel::Color* _colors = NULL;
 
 	inline uint8_t brightness() {
-		return _dark ? statusStripDarkBrightness : statusStripBrightBrightness;
+		return _brightness;
 	}
-
-	void setDark(bool dark, bool show = true) {
-		if (dark != _dark) {
-			_dark = dark;
-			if (show) {
-				showPixels();
-			}
+	
+	void setBrightness(uint8_t brightness, bool force = false) {
+		if (brightness != _brightness || force) {
+			_brightness = brightness;
+			showPixels();
+			setIndicatorBrightness(_brightness);
 		}
 	}
 
+	void updateAmbientLight(uint16_t ambientLight) {
+		uint8_t newBrightness = _brightness;
+
+		if (_brightness == statusStripOffBrightness) {
+			if (ambientLight >= statusStripDarkHighThreshold) {
+				newBrightness = statusStripHighBrightness;
+			}
+			else if (ambientLight >= statusStripOffHighThreshold) {
+				newBrightness = statusStripDarkBrightness;
+			}
+		}
+		else if (_brightness == statusStripDarkBrightness) {
+			if (ambientLight >= statusStripDarkHighThreshold) {
+				newBrightness = statusStripHighBrightness;
+			}
+			else if (ambientLight <= statusStripOffLowThreshold) {
+				newBrightness = statusStripOffBrightness;
+			}
+		}
+		else { // StatusBright
+			if (ambientLight <= statusStripDarkLowThreshold) {
+				newBrightness = statusStripDarkBrightness;
+			}
+			else if (ambientLight <= statusStripOffLowThreshold) {
+				newBrightness = statusStripOffBrightness;
+			}
+		}
+
+		setBrightness(newBrightness);
+	}
+
 	Pixel::Color colorRGB(uint8_t red, uint8_t green, uint8_t blue) {
-		uint8_t bright = brightness();
-		return Pixel::RGB(mul8x8(red, bright), mul8x8(green, bright), mul8x8(blue, bright));
+		return Pixel::RGB(pixBright(red, _brightness), pixBright(green, _brightness), pixBright(blue, _brightness));
 	}
 
 	Pixel::Color colorForState(BreakerState_t state) {
@@ -303,7 +343,7 @@ struct StatusStrip {
 		_strip->set(_colors, _length);
 	}
 
-	void setPixel(uint8_t index, BreakerState_t state, bool show = true) {
+	void setPixel(uint16_t index, BreakerState_t state, bool show = true) {
 		if (_status == NULL) return;
 		
 		if (index < _length) {
@@ -338,17 +378,14 @@ struct StatusStrip {
 	}
 
 	void begin(uint8_t pin, uint16_t length, bool reversed) {
-		_dark = true;
 		_reversed = reversed;
 		_length = length;
 		_strip = new Pixel2(pin, STATUS_STRIP_COLOR_ORDER);
 		_strip->setTiming(STATUS_STRIP_TIMING);
 		_status = new BreakerState_t[_length];
 		_colors = new Pixel::Color[_length];
-		for (auto i=0; i<_length; i++) {
-			_status[i] = breakerStateUnknown;
-		}
-		showPixels();
+		_brightness = statusStripDarkBrightness;
+		clear(true);
 	}
 };
 
@@ -378,6 +415,7 @@ struct BreakerController : Service::Outlet {
 	int _statusIndex;
 
 	uint8_t _pinSense;
+	uint16_t _lastADCValue = 0;
 	uint16_t _senseOffLevel;
 	uint16_t _senseOnLevel;
 	int16_t _senseHysterisisValue = -1;
@@ -388,7 +426,7 @@ struct BreakerController : Service::Outlet {
 	Blinker* _blinker = NULL;
 	int _pinLED;
 	BreakerState_t _ledState = breakerStateUnknown;
-	bool _dark = false;
+	bool _ledDark = false;
 
 	bool _breakerOn;
 
@@ -421,7 +459,7 @@ struct BreakerController : Service::Outlet {
 		_pinLED = pinLED;
 		_led = new BlinkableLEDPin(pinLED, 0);
 		_blinker = new Blinker(_led);
-		setDark(_dark, true);
+		setLEDDark(true, true);
 
 		_statusStrip = statusStrip;
 		_statusIndex = statusIndex;
@@ -444,8 +482,8 @@ struct BreakerController : Service::Outlet {
 		_breakerOn = state == breakerStateOn;
 		_power = new Characteristic::On(_breakerOn);
 
-		setLED(state);
-		setStatus(state);
+		setLEDState(state);
+		setStatusPixel(state);
 
 		new Service::ContactSensor();
 			_tripped = new Characteristic::ContactSensorState(trippedSensorFalse);
@@ -477,10 +515,10 @@ struct BreakerController : Service::Outlet {
 	}
 
 	BreakerState_t breakerState(uint16_t* value = NULL, bool useHysterisis = false) {
-		uint16_t adcVal = analogReadClean(_pinSense);
+		_lastADCValue = analogReadClean(_pinSense);
 
 		if (value) {
-			*value = adcVal;
+			*value = _lastADCValue;
 		}
 		if (!useHysterisis) {
 			_senseHysterisisValue = -1;
@@ -494,23 +532,27 @@ struct BreakerController : Service::Outlet {
 			senseOff = max(senseOff - hysterisisRange / 2, min(senseOff, _senseHysterisisValue - hysterisisRange));
 		}
 
-		if (adcVal >= senseOn) {
+		if (_lastADCValue >= senseOn) {
 			_senseHysterisisValue = -1;
 			return breakerStateOn;
 		}
-		else if (adcVal <= senseOff) {
+		else if (_lastADCValue <= senseOff) {
 			_senseHysterisisValue = -1;
 			return breakerStateOff;
 		}
 		else {
 			if (useHysterisis) {
-				_senseHysterisisValue = adcVal;
+				_senseHysterisisValue = _lastADCValue;
 			}
 			return breakerStateTripped;
 		}
 	}
 
-	void setStatus(BreakerState_t state) {
+	uint16_t lastADCValue() {
+		return _lastADCValue;
+	}
+
+	void setStatusPixel(BreakerState_t state) {
 		_statusStrip->setPixel(_statusIndex, state);
 	}
 
@@ -522,15 +564,21 @@ struct BreakerController : Service::Outlet {
 		}
 	}
 
-	void setDark(bool dark, bool force) {
-		if (dark != _dark || force) {
-			_dark = dark;
-			_led->setOnLevel(_dark ? ledDarkBrightness : ledBrightBrightness);
-			updateLED();
+	void setLEDDark(bool dark, bool force = false) {
+		if (dark != _ledDark || force) {
+			_ledDark = dark;
+			_led->setOnLevel(_ledDark ? ledDarkBrightness : ledBrightBrightness);
+			if (force || _ledState != breakerStateTripped) {
+				updateLED();
+			}
 		}
 	}
 
-	void setLED(BreakerState_t state) {
+	bool ledDark() {
+		return _ledDark;
+	}
+
+	void setLEDState(BreakerState_t state) {
 		if (state != _ledState) {
 			_ledState = state;
 			updateLED();
@@ -634,8 +682,8 @@ struct BreakerController : Service::Outlet {
 			}
 		}
 
-		setLED(state);
-		setStatus(state);
+		setLEDState(state);
+		setStatusPixel(state);
 	}
 
 	void setPower(bool value, uint32_t afterDelayMS = 0) {
@@ -657,6 +705,10 @@ struct BreakerController : Service::Outlet {
 
 	bool power() {
 		return (_delayedChangeTo != -1) ? _delayedChangeTo : _power->getVal();
+	}
+
+	bool tripped() {
+		return _ledState == breakerStateTripped;
 	}
 
 	void setBuddy(BreakerController* buddy) {
@@ -696,7 +748,9 @@ struct BreakerController : Service::Outlet {
 			Serial.printf("Press <return> to save, press <esc> to exit\n");
 			while (!done) {
 				if (update) {
-					printAndBackUp("%6lld: Current %s angle: % 3dº", millis64(), names[indexes[curIndex]], *values[indexes[curIndex]]);
+					uint16_t adcValue;
+					breakerState(&adcValue);
+					printAndBackUp("%6lld: Current %s angle: % 3dº (adc=% 4d)", millis64(), names[indexes[curIndex]], *values[indexes[curIndex]], adcValue);
 					setServoAngle(*values[indexes[curIndex]], true);
 					update = false;
 				}
@@ -1047,8 +1101,27 @@ void cmdToggleADCStatus(const char *buf) {
 	Serial.printf("ADC Status: %s\n", adcStatusEnabled ? "ON" : "OFF");
 }
 
+void cmdSetCPUFrequency(const char *buf) {
+	buf++;
+	if (buf[0] == 0) {
+		Serial.printf("\n%6lld: Current CPU frequency: %luMHz\n", millis64(), getCpuFrequencyMhz());
+	}
+	else {
+		uint32_t freq = atoi(buf);
+		if (freq == 80 || freq == 160 || freq == 240) {
+			Serial.printf("\n%6lld: Setting CPU frequency to %luMHz\n", millis64(), freq);
+			setCpuFrequencyMhz(freq);
+			Serial.printf("\n%6lld: New CPU frequency: %luMHz\n", millis64(), getCpuFrequencyMhz());
+		}
+		else {
+			Serial.printf("\n%6lld: Invalid CPU frequency. Use '80', '160', or '240'.\n", millis64());
+		}
+	}
+}
+
 void addCommands() {
 	new SpanUserCommand('s',"show CPU stats", cmdShowCPUStats);
+	new SpanUserCommand('c',"set CPU frequency to 80, 160, or 240MHz", cmdSetCPUFrequency);
 	new SpanUserCommand('u',"update accessory database", cmdUpdateAccessories);
 	new SpanUserCommand('x',"clear preferences", cmdClearPreferences);
 	new SpanUserCommand('a',"toggle ADC/Ambient value display", cmdToggleADCStatus);
@@ -1098,7 +1171,7 @@ void setup() {
 	SerPrintf("Power Center Controller Startup\n");
 
 	SerPrintf("Setup status LED strip\n");
-	statusStrip.setDark(false, false);
+	statusStrip.setBrightness(statusStripHighBrightness);
 
 	for (auto i=-1; i<=statusStripLength; i++) {
 		statusStrip.setPixel(i-1, breakerStateUnknown, false);
@@ -1108,7 +1181,7 @@ void setup() {
 		delay(100);
 	}
 
-	statusStrip.setDark(true, false);
+	statusStrip.setBrightness(statusStripDarkBrightness);
 
 	SerPrintf("Initialize Preferences\n");
 	preferences.begin(prefsPartitionName, false);
@@ -1126,8 +1199,68 @@ void setup() {
 	SerPrintf("Add Commands\n");
 	addCommands();
 
+	// setCpuFrequencyMhz(160);
+
 	SerPrintf("Init complete.\n");
 }
+
+uint16_t remoteAmbientLight = 0;
+
+void checkRemoteAmbientLight() {
+	static uint64_t ambientCheckTime = 0;
+	uint64_t curTime = millis64();
+
+	if (curTime >= ambientCheckTime) {
+		ambientCheckTime = curTime + lightCheckRateMS;
+		bool tripped = false;
+
+		if (washer->tripped()) {
+			washer->setLEDDark(false);
+			tripped = true;
+		}
+		if (dryer->tripped()) {
+			dryer->setLEDDark(false);
+			tripped = true;
+		}
+		if (inverter->tripped()) {
+			inverter->setLEDDark(false);
+			tripped = true;
+		}
+		if (converter->tripped()) {
+			converter->setLEDDark(false);
+			tripped = true;
+		}
+
+		if (!tripped) {
+			bool curDark = washer->ledDark();
+			bool newDark = curDark;
+
+			pinMode(pinLedWasher, OUTPUT);
+			digitalWrite(pinLedWasher, HIGH);
+
+			delayMicroseconds(100);
+
+			remoteAmbientLight = analogReadClean(pinLedDryer, ambientLightReadCount);
+
+			if (curDark && remoteAmbientLight > remoteLEDAmbientLightHigh) {
+				newDark = false;
+			}
+			else if (!curDark && remoteAmbientLight < remoteLEDAmbientLightLow) {
+				newDark = true;
+			}
+
+			pinMode(pinLedDryer, OUTPUT);	// Restore dryer LED pin to output mode
+			digitalWrite(pinLedDryer, LOW);
+
+			washer->setLEDDark(newDark, true);
+			dryer->setLEDDark(newDark, true);
+			inverter->setLEDDark(newDark);
+			converter->setLEDDark(newDark);
+		}
+	}
+}
+
+uint16_t panelAmbientLight = 0;
 
 void checkAmbientLight() {
 	static uint64_t ambientCheckTime = 0;
@@ -1135,14 +1268,8 @@ void checkAmbientLight() {
 
 	if (curTime >= ambientCheckTime) {
 		ambientCheckTime = curTime + lightCheckRateMS;
-		uint16_t ambientLight = analogReadClean(ambientLightPin, ambientLightReadCount);
-
-		if (ambientLight <= darkLowThreshold) {
-			statusStrip.setDark(true);
-		}
-		else if (ambientLight >= darkHighThreshold) {
-			statusStrip.setDark(false);
-		}
+		panelAmbientLight = analogReadClean(ambientLightPin, ambientLightReadCount);
+		statusStrip.updateAmbientLight(panelAmbientLight);
 	}
 }
 
@@ -1155,13 +1282,9 @@ void showADCStatus() {
 		if (curTime >= nextStatusTime) {
 			nextStatusTime = curTime + statusUpdateRateMS;
 
-			uint16_t adcWasher = analogReadClean(pinSenseWasher);
-			uint16_t adcDryer = analogReadClean(pinSenseDryer);
-			uint16_t adcInverter = analogReadClean(pinSenseInverter);
-			uint16_t adcConverter = analogReadClean(pinSenseConverter);
-			uint16_t ambientLight = analogReadClean(ambientLightPin, ambientLightReadCount);
-
-			Serial.printf("%6lld: ADC Washer: %4d, Dryer: %4d, Inverter: %4d, Converter: %4d - Ambient Light: %4d\n", curTime, adcWasher, adcDryer, adcInverter, adcConverter, ambientLight);
+			Serial.printf("%6lld: ADC: Washer=%4d, Dryer=%4d, Inverter=%4d, Converter=%4d - Ambient: Panel=%d/0x%02X, Remote=%d/%s\n",
+				curTime, washer->lastADCValue(), dryer->lastADCValue(), inverter->lastADCValue(), converter->lastADCValue(),
+				panelAmbientLight, statusStrip.brightness(), remoteAmbientLight, washer->ledDark()?"dark":"bright");
 		}
 	}
 }
@@ -1170,5 +1293,6 @@ void loop() {
 	homeSpan.poll();
 
 	checkAmbientLight();
+	checkRemoteAmbientLight();
 	showADCStatus();
 }
